@@ -265,8 +265,8 @@ Ready to start your day? Let me know if anything needs adjustment!
 
 - **Atlas**: OpenAI GPT-5.2 API
 - **Forge**: DeepSeek-V3.1 API
-- **Olive**: Moonshot Kimi K2-0905 API
-- **Lexicon**: Moonshot Kimi K2-0905 API
+- **Olive**: Moonshot Kimi (default: `kimi-k2-0905-preview`)
+- **Lexicon**: Moonshot Kimi (default: `kimi-k2-0905-preview`)
 - **Embeddings**: OpenAI text-embedding-3-small (for vector search)
 
 
@@ -4436,7 +4436,11 @@ SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
 # AI APIs
 OPENAI_API_KEY=sk-...
 DEEPSEEK_API_KEY=...
-MOONSHOT_API_KEY=...
+KIMI_API_KEY=...
+
+# Optional model routing
+KIMI_BASE_URL=https://api.moonshot.ai/v1
+KIMI_MODEL=kimi-k2-0905-preview
 
 # External APIs
 SPOONACULAR_API_KEY=...
@@ -4534,7 +4538,7 @@ vercel env add NEXT_PUBLIC_SUPABASE_ANON_KEY
 vercel env add SUPABASE_SERVICE_ROLE_KEY
 vercel env add OPENAI_API_KEY
 vercel env add DEEPSEEK_API_KEY
-vercel env add MOONSHOT_API_KEY
+vercel env add KIMI_API_KEY
 vercel env add SPOONACULAR_API_KEY
 vercel env add EDAMAM_APP_ID
 vercel env add EDAMAM_APP_KEY
