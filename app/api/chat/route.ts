@@ -78,6 +78,25 @@ const ScheduleDeleteArgsSchema = z.object({
   scheduleId: z.string().min(1),
 });
 
+const MealTypeSchema = z.enum(["breakfast", "lunch", "dinner", "snack"]);
+
+const MealSwapArgsSchema = z
+  .object({
+    mealId: z.string().min(1).optional(),
+    mealType: MealTypeSchema.optional(),
+    scheduledDate: DateOnlySchema.optional(),
+    scheduledTime: TimeHHMMSchema.optional(),
+    oldMealName: z.string().min(1).optional(),
+    newMealName: z.string().min(1),
+    calories: z.number().min(0).optional(),
+    protein_g: z.number().min(0).optional(),
+    carbs_g: z.number().min(0).optional(),
+    fats_g: z.number().min(0).optional(),
+  })
+  .refine((v) => !!v.mealId || (!!v.mealType && !!v.scheduledDate), {
+    message: "Provide mealId, or mealType+scheduledDate",
+  });
+
 function formatPlanDateInTimeZone(timeZone: string | null | undefined) {
   const tz =
     typeof timeZone === "string" && timeZone.trim() ? timeZone.trim() : "UTC";
@@ -459,6 +478,41 @@ function buildScheduleTools(params: { allowDelete: boolean }) {
   return tools;
 }
 
+function buildMealTools() {
+  const tools: OpenAI.Chat.ChatCompletionTool[] = [
+    {
+      type: "function",
+      function: {
+        name: "meal_swap",
+        description:
+          "Replace a meal in the user's meal plan with a newly chosen alternative. Only say it was swapped after this succeeds.",
+        parameters: {
+          type: "object",
+          additionalProperties: false,
+          required: ["newMealName"],
+          properties: {
+            mealId: { type: "string", description: "Existing meal row id" },
+            mealType: {
+              type: "string",
+              enum: ["breakfast", "lunch", "dinner", "snack"],
+            },
+            scheduledDate: { type: "string", description: "YYYY-MM-DD" },
+            scheduledTime: { type: "string", description: "HH:MM (24h)" },
+            oldMealName: { type: "string" },
+            newMealName: { type: "string", description: "New meal name" },
+            calories: { type: "number" },
+            protein_g: { type: "number" },
+            carbs_g: { type: "number" },
+            fats_g: { type: "number" },
+          },
+        },
+      },
+    },
+  ];
+
+  return tools;
+}
+
 async function getScheduleRowsForUser(params: {
   supabase: ReturnType<typeof getSupabaseAdmin>;
   userId: string;
@@ -694,6 +748,166 @@ async function scheduleList(params: {
   return { ok: true, rows: filtered } as const;
 }
 
+function toHHMMSS(value: string) {
+  const trimmed = value.trim();
+  const match = trimmed.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return trimmed;
+  const hh = Math.min(23, Math.max(0, Number(match[1])));
+  const mm = Math.min(59, Math.max(0, Number(match[2])));
+  const ss = match[3] ? Math.min(59, Math.max(0, Number(match[3]))) : 0;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(
+    2,
+    "0"
+  )}:${String(ss).padStart(2, "0")}`;
+}
+
+async function mealSwap(params: {
+  supabase: ReturnType<typeof getSupabaseAdmin>;
+  userId: string;
+  args: z.infer<typeof MealSwapArgsSchema>;
+}) {
+  const baseSelect =
+    "id, meal_plan_id, meal_type, scheduled_date, scheduled_time, name, swap_count, status";
+
+  type TargetMeal = {
+    id: string;
+    meal_plan_id: string;
+    meal_type: string;
+    scheduled_date: string;
+    scheduled_time: string;
+    name: string;
+    swap_count: number | null;
+    status: string | null;
+  };
+
+  let target: TargetMeal | null = null;
+
+  if (params.args.mealId) {
+    const { data } = await params.supabase
+      .from("meals")
+      .select(baseSelect)
+      .eq("user_id", params.userId)
+      .eq("id", params.args.mealId)
+      .maybeSingle();
+    target = (data as TargetMeal | null) ?? null;
+  } else if (params.args.mealType && params.args.scheduledDate) {
+    const query = params.supabase
+      .from("meals")
+      .select(baseSelect)
+      .eq("user_id", params.userId)
+      .eq("status", "active")
+      .eq("meal_type", params.args.mealType)
+      .eq("scheduled_date", params.args.scheduledDate);
+
+    const scheduledTime = params.args.scheduledTime?.trim()
+      ? toHHMMSS(params.args.scheduledTime)
+      : null;
+
+    const { data } = scheduledTime
+      ? await query.eq("scheduled_time", scheduledTime).limit(5)
+      : await query.order("scheduled_time", { ascending: true }).limit(25);
+
+    const rows = ((data as unknown[] | null) ?? []) as Array<
+      Record<string, unknown>
+    >;
+
+    const normalizedOld = params.args.oldMealName?.trim().toLowerCase() ?? null;
+    const pick =
+      scheduledTime || rows.length <= 1
+        ? rows[0]
+        : normalizedOld
+          ? (rows.find(
+              (r) =>
+                String(r.name ?? "")
+                  .trim()
+                  .toLowerCase() === normalizedOld
+            ) ?? rows[0])
+          : rows[0];
+
+    target = pick
+      ? ({
+          id: String(pick.id),
+          meal_plan_id: String(pick.meal_plan_id),
+          meal_type: String(pick.meal_type),
+          scheduled_date: String(pick.scheduled_date),
+          scheduled_time: String(pick.scheduled_time),
+          name: String(pick.name),
+          swap_count:
+            typeof pick.swap_count === "number"
+              ? (pick.swap_count as number)
+              : null,
+          status:
+            typeof pick.status === "string" ? (pick.status as string) : null,
+        } as TargetMeal)
+      : null;
+  }
+
+  if (!target?.id || !target.meal_plan_id) {
+    return { ok: false, error: "Could not find the meal to swap." } as const;
+  }
+
+  if ((target.status ?? "active") !== "active") {
+    return { ok: false, error: "That meal is not active anymore." } as const;
+  }
+
+  const newName = params.args.newMealName.trim();
+  if (!newName) {
+    return { ok: false, error: "Missing new meal name." } as const;
+  }
+
+  const { data: inserted, error: insertError } = await params.supabase
+    .from("meals")
+    .insert({
+      user_id: params.userId,
+      meal_plan_id: target.meal_plan_id,
+      meal_type: target.meal_type,
+      scheduled_date: target.scheduled_date,
+      scheduled_time: target.scheduled_time,
+      name: newName,
+      ingredients: [],
+      preparation_steps: null,
+      calories:
+        typeof params.args.calories === "number" ? params.args.calories : null,
+      protein_g:
+        typeof params.args.protein_g === "number"
+          ? params.args.protein_g
+          : null,
+      carbs_g:
+        typeof params.args.carbs_g === "number" ? params.args.carbs_g : null,
+      fats_g:
+        typeof params.args.fats_g === "number" ? params.args.fats_g : null,
+      status: "active",
+      original_meal_id: target.id,
+    })
+    .select("id")
+    .single();
+
+  if (insertError || !inserted?.id) {
+    return {
+      ok: false,
+      error: insertError?.message ?? "Failed to insert swapped meal.",
+    } as const;
+  }
+
+  const nextSwapCount = (target.swap_count ?? 0) + 1;
+  const { error: updateError } = await params.supabase
+    .from("meals")
+    .update({ status: "replaced", swap_count: nextSwapCount })
+    .eq("user_id", params.userId)
+    .eq("id", target.id)
+    .eq("status", "active");
+
+  if (updateError) {
+    return { ok: false, error: updateError.message } as const;
+  }
+
+  return {
+    ok: true,
+    replacedMealId: target.id,
+    newMealId: String((inserted as { id: unknown }).id),
+  } as const;
+}
+
 async function runScheduleToolCall(params: {
   supabase: ReturnType<typeof getSupabaseAdmin>;
   userId: string;
@@ -772,6 +986,18 @@ async function runScheduleToolCall(params: {
       supabase: params.supabase,
       userId: params.userId,
       scheduleId: parsed.data.scheduleId,
+    });
+  }
+
+  if (name === "meal_swap") {
+    const parsed = MealSwapArgsSchema.safeParse(args);
+    if (!parsed.success) {
+      return { ok: false, error: "Invalid meal_swap arguments." } as const;
+    }
+    return mealSwap({
+      supabase: params.supabase,
+      userId: params.userId,
+      args: parsed.data,
     });
   }
 
@@ -910,10 +1136,11 @@ export async function POST(request: Request) {
     ? await supabase
         .from("meals")
         .select(
-          "id, meal_type, scheduled_time, scheduled_date, name, calories, protein_g, carbs_g, fats_g, actually_eaten, logged_at"
+          "id, meal_type, scheduled_time, scheduled_date, name, calories, protein_g, carbs_g, fats_g, status, actually_eaten, logged_at"
         )
         .eq("meal_plan_id", mealPlanId)
         .eq("user_id", body.userId)
+        .eq("status", "active")
         .order("scheduled_time", { ascending: true })
     : { data: null };
 
@@ -951,6 +1178,13 @@ export async function POST(request: Request) {
     "- If the user asks to add/schedule an event, you MUST call schedule_create (do not just promise).",
     "- Use schedule_list to check conflicts when needed before scheduling.",
     "- schedule_delete is only for explicit user requests to delete/remove/cancel an event.",
+  ].join("\n");
+  const mealToolPolicy = [
+    "MEAL SWAPS PERSISTENCE:",
+    "- You have a tool meal_swap to replace a meal in the user's plan.",
+    "- If the user confirms a swap (e.g. chooses Option 1/2/3), you MUST call meal_swap.",
+    "- Prefer MEAL_ID from the user's message when present (MEAL_ID=...).",
+    "- Do not claim the meal was swapped unless the tool returns ok:true.",
   ].join("\n");
 
   let memoryLines: string[] = [];
@@ -990,10 +1224,15 @@ export async function POST(request: Request) {
 
   const allowDelete = isExplicitDeletionRequest(body.message);
   const scheduleTools = buildScheduleTools({ allowDelete });
+  const mealTools = buildMealTools();
+  const tools = [...scheduleTools, ...mealTools];
 
   const messages: OpenAI.Chat.ChatCompletionMessageParam[] = [
     { role: "system", content: system },
     { role: "system", content: scheduleToolPolicy },
+    ...(body.manager === "olive"
+      ? [{ role: "system" as const, content: mealToolPolicy }]
+      : []),
     {
       role: "system",
       content: "User profile context (JSON): " + safeJsonString(profileContext),
@@ -1056,7 +1295,7 @@ export async function POST(request: Request) {
           model: cfg.model,
           messages: workingMessages,
           temperature: body.manager === "atlas" ? 0.4 : 0.6,
-          tools: scheduleTools,
+          tools,
           tool_choice: "auto",
         });
 

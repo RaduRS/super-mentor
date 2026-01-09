@@ -1,0 +1,9 @@
+{
+  "crons": [
+    {
+      "path": "/api/cron/proactive-checks",
+      "schedule": "*/30 * * * *"
+    }
+  ]
+}
+

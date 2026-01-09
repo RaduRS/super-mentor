@@ -3,6 +3,15 @@
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { useForm } from "react-hook-form";
+import {
+  CartesianGrid,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { z } from "zod";
 
 import { Button } from "@/components/ui/button";
@@ -100,6 +109,18 @@ function getDefaultMeasuredAtLocal() {
   return `${yyyy}-${mm}-${dd}T${hh}:${min}`;
 }
 
+type ProgressMetric = "weight" | "belly" | "bodyFat";
+
+function formatAxisDate(milliseconds: number) {
+  const date = new Date(milliseconds);
+  return date.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+}
+
+function formatTooltipDate(milliseconds: number) {
+  const date = new Date(milliseconds);
+  return date.toLocaleString();
+}
+
 const MeasurementFormSchema = z.object({
   measuredAt: z.string().min(1),
   weightKg: z.union([z.string(), z.number()]).optional(),
@@ -143,6 +164,10 @@ export function ProfileDashboard(props: { userId: string }) {
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [progressMetric, setProgressMetric] = useState<ProgressMetric>("weight");
+  const [progressRangeDays, setProgressRangeDays] = useState<30 | 90 | 365 | 0>(
+    90
+  );
 
   const form = useForm<MeasurementFormValues>({
     resolver: zodResolver(MeasurementFormSchema),
@@ -192,7 +217,7 @@ export function ProfileDashboard(props: { userId: string }) {
         )
         .eq("user_id", userId)
         .order("measured_at", { ascending: false })
-        .limit(5);
+        .limit(90);
 
       if (measurementError) {
         setError(measurementError.message);
@@ -257,6 +282,63 @@ export function ProfileDashboard(props: { userId: string }) {
 
   const latest = measurements[0] ?? null;
   const previous = measurements[1] ?? null;
+
+  const progressData = useMemo(() => {
+    const now = Date.now();
+    const cutoff =
+      progressRangeDays === 0 ? null : now - progressRangeDays * 24 * 60 * 60 * 1000;
+
+    const filtered = cutoff
+      ? measurements.filter((m) => {
+          const ts = new Date(m.measured_at).getTime();
+          return Number.isFinite(ts) && ts >= cutoff;
+        })
+      : measurements;
+
+    const sortedAscending = [...filtered].sort(
+      (a, b) =>
+        new Date(a.measured_at).getTime() - new Date(b.measured_at).getTime()
+    );
+
+    return sortedAscending.map((m) => {
+      const ts = new Date(m.measured_at).getTime();
+      return {
+        ts,
+        weight: m.weight_kg ?? null,
+        belly: m.belly_cm ?? null,
+        bodyFat: m.body_fat_percentage ?? null,
+      };
+    });
+  }, [measurements, progressRangeDays]);
+
+  const progressMeta = useMemo(() => {
+    if (progressMetric === "belly") {
+      return {
+        label: "Belly (cm)",
+        unit: "cm",
+        color: "#0ea5e9",
+        dataKey: "belly" as const,
+      };
+    }
+    if (progressMetric === "bodyFat") {
+      return {
+        label: "Body fat (%)",
+        unit: "%",
+        color: "#a855f7",
+        dataKey: "bodyFat" as const,
+      };
+    }
+    return {
+      label: "Weight (kg)",
+      unit: "kg",
+      color: "#22c55e",
+      dataKey: "weight" as const,
+    };
+  }, [progressMetric]);
+
+  const hasProgressData = useMemo(() => {
+    return progressData.some((p) => typeof p[progressMeta.dataKey] === "number");
+  }, [progressData, progressMeta.dataKey]);
 
   return (
     <div className="flex flex-col gap-6">
@@ -456,6 +538,130 @@ export function ProfileDashboard(props: { userId: string }) {
               </div>
             </div>
 
+            <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-black">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+                  <div>
+                    <div className="text-sm font-medium">Progress</div>
+                    <div className="text-xs text-zinc-500 dark:text-zinc-400">
+                      {progressRangeDays === 0
+                        ? "All time"
+                        : `Last ${progressRangeDays} days`}
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={progressMetric === "weight" ? "secondary" : "outline"}
+                      onClick={() => setProgressMetric("weight")}
+                    >
+                      Weight
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={progressMetric === "belly" ? "secondary" : "outline"}
+                      onClick={() => setProgressMetric("belly")}
+                    >
+                      Belly
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant={progressMetric === "bodyFat" ? "secondary" : "outline"}
+                      onClick={() => setProgressMetric("bodyFat")}
+                    >
+                      Body fat
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap gap-2">
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={progressRangeDays === 30 ? "secondary" : "outline"}
+                    onClick={() => setProgressRangeDays(30)}
+                  >
+                    30d
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={progressRangeDays === 90 ? "secondary" : "outline"}
+                    onClick={() => setProgressRangeDays(90)}
+                  >
+                    90d
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={progressRangeDays === 365 ? "secondary" : "outline"}
+                    onClick={() => setProgressRangeDays(365)}
+                  >
+                    1y
+                  </Button>
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant={progressRangeDays === 0 ? "secondary" : "outline"}
+                    onClick={() => setProgressRangeDays(0)}
+                  >
+                    All
+                  </Button>
+                </div>
+
+                <div className="h-56 w-full sm:h-64">
+                  {progressData.length < 2 || !hasProgressData ? (
+                    <div className="flex h-full items-center justify-center text-sm text-zinc-600 dark:text-zinc-400">
+                      Log at least two measurements to see a trend.
+                    </div>
+                  ) : (
+                    <ResponsiveContainer width="100%" height="100%">
+                      <LineChart data={progressData}>
+                        <CartesianGrid strokeDasharray="3 3" />
+                        <XAxis
+                          dataKey="ts"
+                          type="number"
+                          domain={["dataMin", "dataMax"]}
+                          tickFormatter={(v) => formatAxisDate(Number(v))}
+                          minTickGap={24}
+                        />
+                        <YAxis
+                          tickFormatter={(v) =>
+                            typeof v === "number"
+                              ? `${Math.round(v * 10) / 10}${progressMeta.unit}`
+                              : String(v)
+                          }
+                        />
+                        <Tooltip
+                          labelFormatter={(label) =>
+                            formatTooltipDate(Number(label))
+                          }
+                          formatter={(value) => {
+                            if (typeof value !== "number" || !Number.isFinite(value)) {
+                              return ["—", progressMeta.label];
+                            }
+                            const rounded = Math.round(value * 10) / 10;
+                            return [`${rounded}${progressMeta.unit}`, progressMeta.label];
+                          }}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey={progressMeta.dataKey}
+                          stroke={progressMeta.color}
+                          strokeWidth={2}
+                          dot={false}
+                          connectNulls={false}
+                        />
+                      </LineChart>
+                    </ResponsiveContainer>
+                  )}
+                </div>
+              </div>
+            </div>
+
             <form
               className="flex flex-col gap-4"
               onSubmit={form.handleSubmit(onLogMeasurements)}
@@ -580,7 +786,7 @@ export function ProfileDashboard(props: { userId: string }) {
                 <div className="text-xs text-zinc-500 dark:text-zinc-400">
                   {loading
                     ? "Loading…"
-                    : `${measurements.length} record${measurements.length === 1 ? "" : "s"}`}
+                    : `Showing ${Math.min(5, measurements.length)} of ${measurements.length}`}
                 </div>
               </div>
               <div className="mt-3 flex flex-col gap-2">
@@ -589,7 +795,7 @@ export function ProfileDashboard(props: { userId: string }) {
                     No measurements yet.
                   </div>
                 ) : (
-                  measurements.map((m) => (
+                  measurements.slice(0, 5).map((m) => (
                     <div
                       key={m.id}
                       className="flex flex-col gap-1 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-xs dark:border-zinc-800 dark:bg-zinc-950"

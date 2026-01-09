@@ -1,6 +1,7 @@
 "use client";
 
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
@@ -26,6 +27,7 @@ import {
 } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
+import { NutritionTrendChart } from "@/components/dashboard/NutritionTrendChart";
 import { getSupabaseBrowser } from "@/lib/supabase/browser";
 import {
   computeFreeTimeWindows,
@@ -81,16 +83,43 @@ type MealRow = {
   protein_g: number | null;
   carbs_g: number | null;
   fats_g: number | null;
+  fiber_g: number | null;
+  vitamin_a_mcg: number | null;
+  vitamin_b12_mcg: number | null;
+  vitamin_c_mg: number | null;
+  vitamin_d_mcg: number | null;
+  vitamin_e_mg: number | null;
+  vitamin_k_mcg: number | null;
+  iron_mg: number | null;
+  calcium_mg: number | null;
+  magnesium_mg: number | null;
+  omega3_g: number | null;
+  status: string | null;
   actually_eaten: boolean | null;
   logged_at: string | null;
 };
 
+type NutritionTrackingRow = {
+  date: string;
+  total_vitamin_d_mcg: number | null;
+  total_vitamin_b12_mcg: number | null;
+  total_iron_mg: number | null;
+  total_calcium_mg: number | null;
+  total_magnesium_mg: number | null;
+  total_omega3_g: number | null;
+  nutrition_score: number | null;
+  deficiencies: string[] | null;
+};
+
 type ReadingSessionRow = {
   id: string;
+  book_id: string | null;
   started_at: string | null;
   ended_at: string | null;
   scheduled_time: string | null;
   duration_minutes: number | null;
+  pages_read: number | null;
+  user_notes: string | null;
   book: { title: string | null; author: string | null } | null;
 };
 
@@ -100,6 +129,15 @@ type BookRow = {
   author: string | null;
   status: string | null;
   priority: number | null;
+};
+
+type BookSearchResult = {
+  source: "openlibrary";
+  key: string | null;
+  title: string | null;
+  author: string | null;
+  firstPublishYear: number | null;
+  coverUrl: string | null;
 };
 
 type ScheduleRow = {
@@ -223,6 +261,7 @@ function colorForEventType(eventType: string | null) {
 export function DailyDashboard(props: { userId: string }) {
   const { userId } = props;
   const supabase = useMemo(() => getSupabaseBrowser(), []);
+  const router = useRouter();
 
   const [loading, setLoading] = useState(false);
   const [generating, setGenerating] = useState(false);
@@ -233,14 +272,30 @@ export function DailyDashboard(props: { userId: string }) {
   const [workoutPlan, setWorkoutPlan] = useState<WorkoutPlanRow | null>(null);
   const [mealPlan, setMealPlan] = useState<MealPlanRow | null>(null);
   const [meals, setMeals] = useState<MealRow[]>([]);
+  const [weekNutrition, setWeekNutrition] = useState<NutritionTrackingRow[]>(
+    []
+  );
   const [readingSession, setReadingSession] =
     useState<ReadingSessionRow | null>(null);
   const [suggestedBook, setSuggestedBook] = useState<BookRow | null>(null);
+  const [readingPagesRead, setReadingPagesRead] = useState("");
+  const [readingNotes, setReadingNotes] = useState("");
   const [scheduleRows, setScheduleRows] = useState<ScheduleRow[]>([]);
   const [scheduleEvents, setScheduleEvents] = useState<ScheduleRow[]>([]);
   const [scheduleFreeWindows, setScheduleFreeWindows] = useState<
     Array<{ startTime: string; endTime: string }>
   >([]);
+  const [bookSearchQuery, setBookSearchQuery] = useState("");
+  const [bookSearchResults, setBookSearchResults] = useState<
+    BookSearchResult[]
+  >([]);
+  const [bookSearchLoading, setBookSearchLoading] = useState(false);
+  const [bookAddLoadingKey, setBookAddLoadingKey] = useState<string | null>(
+    null
+  );
+  const [bookAddFormat, setBookAddFormat] = useState<
+    "physical" | "ebook" | "audiobook"
+  >("physical");
   const [scheduleRange, setScheduleRange] = useState<{
     startTime: string;
     endTime: string;
@@ -422,10 +477,11 @@ export function DailyDashboard(props: { userId: string }) {
         const { data: mealsData } = await supabase
           .from("meals")
           .select(
-            "id, meal_type, scheduled_time, name, calories, protein_g, carbs_g, fats_g, actually_eaten, logged_at"
+            "id, meal_type, scheduled_time, name, calories, protein_g, carbs_g, fats_g, fiber_g, vitamin_a_mcg, vitamin_b12_mcg, vitamin_c_mg, vitamin_d_mcg, vitamin_e_mg, vitamin_k_mcg, iron_mg, calcium_mg, magnesium_mg, omega3_g, status, actually_eaten, logged_at"
           )
           .eq("meal_plan_id", nextPlan.meal_plan_id)
           .eq("user_id", userId)
+          .eq("status", "active")
           .order("scheduled_time", { ascending: true });
         setMeals((mealsData as MealRow[] | null) ?? []);
       } else {
@@ -433,11 +489,28 @@ export function DailyDashboard(props: { userId: string }) {
         setMeals([]);
       }
 
+      const weekStart = format(
+        addDays(parse(effectivePlanDate, "yyyy-MM-dd", new Date()), -6),
+        "yyyy-MM-dd"
+      );
+      const { data: weekNutritionData } = await supabase
+        .from("nutrition_tracking")
+        .select(
+          "date, total_vitamin_d_mcg, total_vitamin_b12_mcg, total_iron_mg, total_calcium_mg, total_magnesium_mg, total_omega3_g, nutrition_score, deficiencies"
+        )
+        .eq("user_id", userId)
+        .gte("date", weekStart)
+        .lte("date", effectivePlanDate)
+        .order("date", { ascending: true });
+      setWeekNutrition(
+        (weekNutritionData as NutritionTrackingRow[] | null) ?? []
+      );
+
       if (nextPlan.reading_goal_id) {
         const { data: sessionData } = await supabase
           .from("reading_sessions")
           .select(
-            "id, started_at, ended_at, scheduled_time, duration_minutes, book:books(title, author)"
+            "id, book_id, started_at, ended_at, scheduled_time, duration_minutes, pages_read, user_notes, book:books(title, author)"
           )
           .eq("id", nextPlan.reading_goal_id)
           .eq("user_id", userId)
@@ -680,6 +753,222 @@ export function DailyDashboard(props: { userId: string }) {
     void load();
   }, [load]);
 
+  function sumOrNull(values: Array<number | null | undefined>) {
+    let sum = 0;
+    let any = false;
+    for (const v of values) {
+      if (typeof v === "number" && Number.isFinite(v)) {
+        sum += v;
+        any = true;
+      }
+    }
+    return any ? sum : null;
+  }
+
+  const nutritionTotals = useMemo(() => {
+    const planned = {
+      calories: sumOrNull(meals.map((m) => m.calories)),
+      protein_g: sumOrNull(meals.map((m) => m.protein_g)),
+      carbs_g: sumOrNull(meals.map((m) => m.carbs_g)),
+      fats_g: sumOrNull(meals.map((m) => m.fats_g)),
+      fiber_g: sumOrNull(meals.map((m) => m.fiber_g)),
+      vitamin_d_mcg: sumOrNull(meals.map((m) => m.vitamin_d_mcg)),
+      vitamin_b12_mcg: sumOrNull(meals.map((m) => m.vitamin_b12_mcg)),
+      iron_mg: sumOrNull(meals.map((m) => m.iron_mg)),
+      calcium_mg: sumOrNull(meals.map((m) => m.calcium_mg)),
+      magnesium_mg: sumOrNull(meals.map((m) => m.magnesium_mg)),
+      omega3_g: sumOrNull(meals.map((m) => m.omega3_g)),
+    };
+
+    const eaten = meals.filter((m) => !!m.actually_eaten);
+    const consumed = {
+      calories: sumOrNull(eaten.map((m) => m.calories)),
+      protein_g: sumOrNull(eaten.map((m) => m.protein_g)),
+      carbs_g: sumOrNull(eaten.map((m) => m.carbs_g)),
+      fats_g: sumOrNull(eaten.map((m) => m.fats_g)),
+      fiber_g: sumOrNull(eaten.map((m) => m.fiber_g)),
+      vitamin_d_mcg: sumOrNull(eaten.map((m) => m.vitamin_d_mcg)),
+      vitamin_b12_mcg: sumOrNull(eaten.map((m) => m.vitamin_b12_mcg)),
+      iron_mg: sumOrNull(eaten.map((m) => m.iron_mg)),
+      calcium_mg: sumOrNull(eaten.map((m) => m.calcium_mg)),
+      magnesium_mg: sumOrNull(eaten.map((m) => m.magnesium_mg)),
+      omega3_g: sumOrNull(eaten.map((m) => m.omega3_g)),
+    };
+
+    return { planned, consumed };
+  }, [meals]);
+
+  const weekDeficiencies = useMemo(() => {
+    if (!weekNutrition.length) return [];
+
+    const rda = {
+      vitamin_d_mcg: 15,
+      vitamin_b12_mcg: 2.4,
+      iron_mg: 8,
+      calcium_mg: 1000,
+      magnesium_mg: 400,
+      omega3_g: 1.6,
+    };
+
+    const byDate = new Map<string, NutritionTrackingRow>();
+    for (const row of weekNutrition) {
+      byDate.set(row.date, row);
+    }
+
+    const start = addDays(parse(planDate, "yyyy-MM-dd", new Date()), -6);
+    const dates: string[] = [];
+    for (let i = 0; i < 7; i += 1) {
+      dates.push(format(addDays(start, i), "yyyy-MM-dd"));
+    }
+
+    const totals = {
+      vitamin_d_mcg: 0,
+      vitamin_b12_mcg: 0,
+      iron_mg: 0,
+      calcium_mg: 0,
+      magnesium_mg: 0,
+      omega3_g: 0,
+    };
+
+    for (const date of dates) {
+      const row = byDate.get(date);
+      totals.vitamin_d_mcg += row?.total_vitamin_d_mcg ?? 0;
+      totals.vitamin_b12_mcg += row?.total_vitamin_b12_mcg ?? 0;
+      totals.iron_mg += row?.total_iron_mg ?? 0;
+      totals.calcium_mg += row?.total_calcium_mg ?? 0;
+      totals.magnesium_mg += row?.total_magnesium_mg ?? 0;
+      totals.omega3_g += row?.total_omega3_g ?? 0;
+    }
+
+    const averages = {
+      vitamin_d_mcg: totals.vitamin_d_mcg / 7,
+      vitamin_b12_mcg: totals.vitamin_b12_mcg / 7,
+      iron_mg: totals.iron_mg / 7,
+      calcium_mg: totals.calcium_mg / 7,
+      magnesium_mg: totals.magnesium_mg / 7,
+      omega3_g: totals.omega3_g / 7,
+    };
+
+    const labels: Record<keyof typeof rda, string> = {
+      vitamin_d_mcg: "Vitamin D",
+      vitamin_b12_mcg: "Vitamin B12",
+      iron_mg: "Iron",
+      calcium_mg: "Calcium",
+      magnesium_mg: "Magnesium",
+      omega3_g: "Omega-3",
+    };
+
+    const deficits: string[] = [];
+    (Object.keys(rda) as Array<keyof typeof rda>).forEach((key) => {
+      if (averages[key] < rda[key] * 0.8) deficits.push(labels[key]);
+    });
+
+    return deficits;
+  }, [planDate, weekNutrition]);
+
+  const todayNutritionScore = useMemo(() => {
+    const row = weekNutrition.find((r) => r.date === planDate);
+    return typeof row?.nutrition_score === "number"
+      ? row.nutrition_score
+      : null;
+  }, [planDate, weekNutrition]);
+
+  async function syncNutritionTracking(dateOnly: string) {
+    const { data: eatenMeals, error: mealsError } = await supabase
+      .from("meals")
+      .select(
+        "calories, protein_g, carbs_g, fats_g, fiber_g, vitamin_a_mcg, vitamin_b12_mcg, vitamin_c_mg, vitamin_d_mcg, vitamin_e_mg, vitamin_k_mcg, iron_mg, calcium_mg, magnesium_mg, omega3_g"
+      )
+      .eq("user_id", userId)
+      .eq("scheduled_date", dateOnly)
+      .eq("actually_eaten", true);
+
+    if (mealsError) throw mealsError;
+
+    const rows = (eatenMeals as Array<Record<string, unknown>> | null) ?? [];
+    const total = (key: string) =>
+      rows.reduce((acc, r) => {
+        const v = r[key];
+        return typeof v === "number" ? acc + v : acc;
+      }, 0);
+
+    const payload = {
+      user_id: userId,
+      date: dateOnly,
+      total_calories: total("calories"),
+      total_protein_g: total("protein_g"),
+      total_carbs_g: total("carbs_g"),
+      total_fats_g: total("fats_g"),
+      total_fiber_g: total("fiber_g"),
+      total_vitamin_a_mcg: total("vitamin_a_mcg"),
+      total_vitamin_b12_mcg: total("vitamin_b12_mcg"),
+      total_vitamin_c_mg: total("vitamin_c_mg"),
+      total_vitamin_d_mcg: total("vitamin_d_mcg"),
+      total_vitamin_e_mg: total("vitamin_e_mg"),
+      total_vitamin_k_mcg: total("vitamin_k_mcg"),
+      total_iron_mg: total("iron_mg"),
+      total_calcium_mg: total("calcium_mg"),
+      total_magnesium_mg: total("magnesium_mg"),
+      total_omega3_g: total("omega3_g"),
+      deficiencies: [] as string[],
+      nutrition_score: 0 as number,
+    };
+
+    const rda = {
+      vitamin_d_mcg: 15,
+      vitamin_b12_mcg: 2.4,
+      iron_mg: 8,
+      calcium_mg: 1000,
+      magnesium_mg: 400,
+      omega3_g: 1.6,
+      fiber_g: 30,
+    };
+
+    const nutrients = [
+      {
+        label: "Vitamin D",
+        value: payload.total_vitamin_d_mcg,
+        rda: rda.vitamin_d_mcg,
+      },
+      {
+        label: "Vitamin B12",
+        value: payload.total_vitamin_b12_mcg,
+        rda: rda.vitamin_b12_mcg,
+      },
+      { label: "Iron", value: payload.total_iron_mg, rda: rda.iron_mg },
+      {
+        label: "Calcium",
+        value: payload.total_calcium_mg,
+        rda: rda.calcium_mg,
+      },
+      {
+        label: "Magnesium",
+        value: payload.total_magnesium_mg,
+        rda: rda.magnesium_mg,
+      },
+      { label: "Omega-3", value: payload.total_omega3_g, rda: rda.omega3_g },
+      { label: "Fiber", value: payload.total_fiber_g, rda: rda.fiber_g },
+    ];
+
+    const deficits: string[] = [];
+    let scoreSum = 0;
+    for (const n of nutrients) {
+      const value =
+        typeof n.value === "number" && Number.isFinite(n.value) ? n.value : 0;
+      if (value < n.rda * 0.8) deficits.push(n.label);
+      const ratio = n.rda > 0 ? value / n.rda : 0;
+      scoreSum += Math.min(1, Math.max(0, ratio));
+    }
+    payload.deficiencies = deficits;
+    payload.nutrition_score = Math.round((scoreSum / nutrients.length) * 100);
+
+    const { error: upsertError } = await supabase
+      .from("nutrition_tracking")
+      .upsert(payload, { onConflict: "user_id,date" });
+
+    if (upsertError) throw upsertError;
+  }
+
   async function onGenerate() {
     if (generating) return;
     setGenerating(true);
@@ -773,11 +1062,48 @@ export function DailyDashboard(props: { userId: string }) {
           .eq("plan_status", "generated");
       }
 
+      const dateOnly = plan?.plan_date?.trim()
+        ? plan.plan_date.trim()
+        : planDate;
+      try {
+        await syncNutritionTracking(dateOnly);
+      } catch (e) {
+        const message =
+          e instanceof Error ? e.message : "Failed to sync nutrition";
+        toast.error(message);
+      }
       toast.success("Meal logged");
       await load();
     } finally {
       setWorking(false);
     }
+  }
+
+  function onSwapMeal(meal: MealRow) {
+    const when = formatTime(meal.scheduled_time) ?? "today";
+    const dateLabel = plan?.plan_date?.trim() ? plan.plan_date.trim() : "today";
+    const cals =
+      typeof meal.calories === "number" ? `${meal.calories} kcal` : "— kcal";
+    const p = typeof meal.protein_g === "number" ? `${meal.protein_g}g` : "—g";
+    const c = typeof meal.carbs_g === "number" ? `${meal.carbs_g}g` : "—g";
+    const f = typeof meal.fats_g === "number" ? `${meal.fats_g}g` : "—g";
+
+    const lines = [
+      `I want to swap my ${meal.meal_type} on ${dateLabel} at ${when}.`,
+      `MEAL_ID=${meal.id}`,
+    ];
+    if (plan?.meal_plan_id) lines.push(`MEAL_PLAN_ID=${plan.meal_plan_id}`);
+    lines.push(
+      `Current meal: "${meal.name}".`,
+      `Macros: ${cals}, ${p} protein, ${c} carbs, ${f} fat.`,
+      "Please suggest 3 alternatives with similar macros, respecting my dietary preferences and food dislikes.",
+      "Label them Option 1/2/3 and include: name, quick ingredients, and estimated macros."
+    );
+    const message = lines.join("\n");
+
+    router.push(
+      `/chat?manager=olive&autosend=1&draft=${encodeURIComponent(message)}`
+    );
   }
 
   async function onStartReadingSession() {
@@ -841,6 +1167,185 @@ export function DailyDashboard(props: { userId: string }) {
       await load();
     } finally {
       setWorking(false);
+    }
+  }
+
+  async function onEndReadingSession() {
+    if (working || !plan?.id || !readingSession?.id) return;
+    if (!readingSession.started_at || readingSession.ended_at) return;
+
+    const endedAt = new Date();
+    const startedAt = new Date(readingSession.started_at);
+    const durationMinutes = Number.isFinite(startedAt.getTime())
+      ? Math.max(
+          0,
+          Math.round((endedAt.getTime() - startedAt.getTime()) / 60000)
+        )
+      : null;
+
+    const pagesRaw = readingPagesRead.trim();
+    const pagesParsed = pagesRaw ? Number(pagesRaw) : null;
+    const pagesRead =
+      pagesParsed === null
+        ? null
+        : Number.isFinite(pagesParsed) && pagesParsed >= 0
+          ? Math.floor(pagesParsed)
+          : null;
+
+    if (pagesRaw && pagesRead === null) {
+      toast.error("Pages read must be a number (0+).");
+      return;
+    }
+
+    setWorking(true);
+    setError(null);
+    try {
+      const { error: updateError } = await supabase
+        .from("reading_sessions")
+        .update({
+          ended_at: endedAt.toISOString(),
+          duration_minutes: durationMinutes,
+          pages_read: pagesRead,
+          user_notes: readingNotes.trim() ? readingNotes.trim() : null,
+        })
+        .eq("id", readingSession.id)
+        .eq("user_id", userId);
+
+      if (updateError) {
+        setError(updateError.message);
+        toast.error(updateError.message);
+        return;
+      }
+
+      if (pagesRead !== null && pagesRead > 0 && readingSession.book_id) {
+        const { data: bookRow } = await supabase
+          .from("books")
+          .select("id, current_page")
+          .eq("id", readingSession.book_id)
+          .eq("user_id", userId)
+          .maybeSingle();
+
+        const currentPage =
+          typeof (bookRow as { current_page?: unknown } | null)
+            ?.current_page === "number"
+            ? Number((bookRow as { current_page?: unknown }).current_page)
+            : 0;
+
+        await supabase
+          .from("books")
+          .update({ current_page: Math.max(0, currentPage + pagesRead) })
+          .eq("id", readingSession.book_id)
+          .eq("user_id", userId);
+      }
+
+      toast.success("Reading session completed");
+      setReadingPagesRead("");
+      setReadingNotes("");
+      await load();
+    } finally {
+      setWorking(false);
+    }
+  }
+
+  async function onSearchBooks() {
+    const query = bookSearchQuery.trim();
+    if (!query) {
+      setBookSearchResults([]);
+      return;
+    }
+
+    setBookSearchLoading(true);
+    setError(null);
+    try {
+      const response = await fetch(
+        `/api/books/search?query=${encodeURIComponent(query)}&limit=10`
+      );
+      const payload: unknown = await response.json().catch(() => null);
+      if (!response.ok) {
+        const message =
+          typeof payload === "object" && payload !== null && "error" in payload
+            ? String(
+                (payload as { error?: unknown }).error ?? "Book search failed"
+              )
+            : "Book search failed";
+        toast.error(message);
+        setBookSearchResults([]);
+        return;
+      }
+
+      const results =
+        typeof payload === "object" && payload !== null && "results" in payload
+          ? (payload as { results?: unknown }).results
+          : null;
+
+      setBookSearchResults(
+        Array.isArray(results) ? (results as BookSearchResult[]) : []
+      );
+    } finally {
+      setBookSearchLoading(false);
+    }
+  }
+
+  async function onAddBookFromSearch(result: BookSearchResult) {
+    const title = result.title?.trim() ?? "";
+    if (!title) {
+      toast.error("This result is missing a title.");
+      return;
+    }
+
+    const dedupeTitle = title.toLowerCase();
+    const dedupeAuthor = (result.author ?? "").trim().toLowerCase();
+    const formatKey = bookAddFormat.toLowerCase();
+    const dedupeKey = `${formatKey}::${dedupeTitle}::${dedupeAuthor}`;
+
+    setBookAddLoadingKey(dedupeKey);
+    setError(null);
+    try {
+      const { data: existing } = await supabase
+        .from("books")
+        .select("id, title, author, format, status")
+        .eq("user_id", userId)
+        .in("status", ["backlog", "reading"])
+        .limit(500);
+
+      const existingKeySet = new Set(
+        (existing ?? [])
+          .map((b) => {
+            const t =
+              typeof b.title === "string" ? b.title.trim().toLowerCase() : "";
+            const a =
+              typeof b.author === "string" ? b.author.trim().toLowerCase() : "";
+            const f =
+              typeof b.format === "string" ? b.format.trim().toLowerCase() : "";
+            return t && f ? `${f}::${t}::${a}` : "";
+          })
+          .filter(Boolean)
+      );
+
+      if (existingKeySet.has(dedupeKey)) {
+        toast.message("Already in your library.");
+        await load();
+        return;
+      }
+
+      const { error: insertError } = await supabase.from("books").insert({
+        user_id: userId,
+        title,
+        author: result.author?.trim() ? result.author.trim() : null,
+        format: bookAddFormat,
+        status: "backlog",
+        open_library_id: result.key,
+      });
+
+      if (insertError) {
+        toast.error(insertError.message);
+        return;
+      }
+
+      toast.success("Book added to backlog");
+      await load();
+    } finally {
+      setBookAddLoadingKey(null);
     }
   }
 
@@ -1284,6 +1789,204 @@ export function DailyDashboard(props: { userId: string }) {
           </CardHeader>
           <CardContent className="flex flex-col gap-4">
             {mealPlan && meals.length ? (
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-950">
+                <div className="flex flex-col gap-3">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="font-medium">Today’s nutrition</div>
+                    <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                      consumed vs planned
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Calories
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {(typeof nutritionTotals.consumed.calories === "number"
+                          ? Math.round(nutritionTotals.consumed.calories)
+                          : "—") +
+                          " / " +
+                          (typeof nutritionTotals.planned.calories === "number"
+                            ? Math.round(nutritionTotals.planned.calories)
+                            : "—")}{" "}
+                        kcal
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Protein
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {(typeof nutritionTotals.consumed.protein_g === "number"
+                          ? Math.round(nutritionTotals.consumed.protein_g)
+                          : "—") +
+                          " / " +
+                          (typeof nutritionTotals.planned.protein_g === "number"
+                            ? Math.round(nutritionTotals.planned.protein_g)
+                            : "—")}{" "}
+                        g
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Carbs
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {(typeof nutritionTotals.consumed.carbs_g === "number"
+                          ? Math.round(nutritionTotals.consumed.carbs_g)
+                          : "—") +
+                          " / " +
+                          (typeof nutritionTotals.planned.carbs_g === "number"
+                            ? Math.round(nutritionTotals.planned.carbs_g)
+                            : "—")}{" "}
+                        g
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Fats
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {(typeof nutritionTotals.consumed.fats_g === "number"
+                          ? Math.round(nutritionTotals.consumed.fats_g)
+                          : "—") +
+                          " / " +
+                          (typeof nutritionTotals.planned.fats_g === "number"
+                            ? Math.round(nutritionTotals.planned.fats_g)
+                            : "—")}{" "}
+                        g
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Fiber
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.fiber_g === "number"
+                          ? Math.round(nutritionTotals.consumed.fiber_g * 10) /
+                            10
+                          : "—"}{" "}
+                        g
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Vitamin D
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.vitamin_d_mcg ===
+                        "number"
+                          ? Math.round(
+                              nutritionTotals.consumed.vitamin_d_mcg * 10
+                            ) / 10
+                          : "—"}{" "}
+                        mcg
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Vitamin B12
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.vitamin_b12_mcg ===
+                        "number"
+                          ? Math.round(
+                              nutritionTotals.consumed.vitamin_b12_mcg * 10
+                            ) / 10
+                          : "—"}{" "}
+                        mcg
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Iron
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.iron_mg === "number"
+                          ? Math.round(nutritionTotals.consumed.iron_mg * 10) /
+                            10
+                          : "—"}{" "}
+                        mg
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Calcium
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.calcium_mg === "number"
+                          ? Math.round(
+                              nutritionTotals.consumed.calcium_mg * 10
+                            ) / 10
+                          : "—"}{" "}
+                        mg
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Magnesium
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.magnesium_mg ===
+                        "number"
+                          ? Math.round(
+                              nutritionTotals.consumed.magnesium_mg * 10
+                            ) / 10
+                          : "—"}{" "}
+                        mg
+                      </div>
+                    </div>
+
+                    <div className="rounded-lg border border-zinc-200 bg-white px-3 py-2 dark:border-zinc-800 dark:bg-black">
+                      <div className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                        Omega-3
+                      </div>
+                      <div className="mt-1 text-sm">
+                        {typeof nutritionTotals.consumed.omega3_g === "number"
+                          ? Math.round(nutritionTotals.consumed.omega3_g * 10) /
+                            10
+                          : "—"}{" "}
+                        g
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                    7-day deficiency check:{" "}
+                    {weekDeficiencies.length
+                      ? weekDeficiencies.join(", ")
+                      : "none detected"}
+                  </div>
+                  <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                    Nutrition score:{" "}
+                    {typeof todayNutritionScore === "number"
+                      ? `${todayNutritionScore}/100`
+                      : "—"}
+                  </div>
+
+                  <div className="mt-2 rounded-lg border border-zinc-200 bg-white px-3 py-3 dark:border-zinc-800 dark:bg-black">
+                    <NutritionTrendChart
+                      endDate={planDate}
+                      weekNutrition={weekNutrition}
+                    />
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            {mealPlan && meals.length ? (
               <div className="grid gap-3">
                 {meals.map((meal) => {
                   const logged = !!meal.actually_eaten;
@@ -1322,14 +2025,24 @@ export function DailyDashboard(props: { userId: string }) {
                           </div>
                         </div>
 
-                        <Button
-                          type="button"
-                          variant={logged ? "outline" : "default"}
-                          onClick={() => void onLogMeal(meal.id)}
-                          disabled={logged || working}
-                        >
-                          {logged ? "Logged" : "Log eaten"}
-                        </Button>
+                        <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-end">
+                          <Button
+                            type="button"
+                            variant={logged ? "outline" : "default"}
+                            onClick={() => void onLogMeal(meal.id)}
+                            disabled={logged || working}
+                          >
+                            {logged ? "Logged" : "Log eaten"}
+                          </Button>
+                          <Button
+                            type="button"
+                            variant="outline"
+                            onClick={() => onSwapMeal(meal)}
+                            disabled={logged || working}
+                          >
+                            Swap
+                          </Button>
+                        </div>
                       </div>
                     </div>
                   );
@@ -1367,6 +2080,17 @@ export function DailyDashboard(props: { userId: string }) {
                     ? `· ${formatTime(readingSession.scheduled_time) ?? ""}`
                     : ""}
                 </div>
+                {readingSession.ended_at ? (
+                  <div className="mt-2 text-xs text-zinc-600 dark:text-zinc-400">
+                    Completed
+                    {typeof readingSession.duration_minutes === "number"
+                      ? ` · ${readingSession.duration_minutes} min`
+                      : ""}
+                    {typeof readingSession.pages_read === "number"
+                      ? ` · ${readingSession.pages_read} pages`
+                      : ""}
+                  </div>
+                ) : null}
               </div>
             ) : suggestedBook ? (
               <div className="rounded-xl border border-zinc-200 bg-white px-4 py-3 text-sm dark:border-zinc-800 dark:bg-black">
@@ -1388,11 +2112,153 @@ export function DailyDashboard(props: { userId: string }) {
               </div>
             )}
 
+            {readingSession?.started_at && !readingSession.ended_at ? (
+              <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div className="flex flex-col gap-2">
+                    <Label htmlFor="readingPages">Pages read (optional)</Label>
+                    <Input
+                      id="readingPages"
+                      inputMode="numeric"
+                      disabled={working}
+                      value={readingPagesRead}
+                      onChange={(e) => setReadingPagesRead(e.target.value)}
+                      placeholder="e.g. 12"
+                    />
+                  </div>
+                  <div className="flex flex-col gap-2 sm:col-span-2">
+                    <Label htmlFor="readingNotes">Notes (optional)</Label>
+                    <Input
+                      id="readingNotes"
+                      disabled={working}
+                      value={readingNotes}
+                      onChange={(e) => setReadingNotes(e.target.value)}
+                      placeholder="1 takeaway, quote, or reflection"
+                    />
+                  </div>
+                </div>
+                <div className="mt-4 flex justify-end">
+                  <Button
+                    type="button"
+                    variant="outline"
+                    onClick={() => void onEndReadingSession()}
+                    disabled={working}
+                  >
+                    End session
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            <div className="rounded-xl border border-zinc-200 bg-zinc-50 px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
+              <div className="flex flex-col gap-3">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end sm:justify-between">
+                  <div>
+                    <div className="text-sm font-medium">Find a book</div>
+                    <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                      Search Open Library and add to your backlog.
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                    <div className="flex flex-col gap-2">
+                      <Label htmlFor="bookFormat">Format</Label>
+                      <select
+                        id="bookFormat"
+                        className="h-9 rounded-md border border-input bg-background px-3 py-1 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-60 dark:bg-input/30"
+                        value={bookAddFormat}
+                        onChange={(e) =>
+                          setBookAddFormat(
+                            e.target.value as "physical" | "ebook" | "audiobook"
+                          )
+                        }
+                      >
+                        <option value="physical">Physical</option>
+                        <option value="ebook">Ebook</option>
+                        <option value="audiobook">Audiobook</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+                  <div className="flex-1">
+                    <Label htmlFor="bookSearch">Search</Label>
+                    <Input
+                      id="bookSearch"
+                      value={bookSearchQuery}
+                      onChange={(e) => setBookSearchQuery(e.target.value)}
+                      placeholder="e.g. Atomic Habits"
+                    />
+                  </div>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    disabled={bookSearchLoading}
+                    onClick={() => void onSearchBooks()}
+                  >
+                    {bookSearchLoading ? "Searching…" : "Search"}
+                  </Button>
+                </div>
+
+                {bookSearchResults.length ? (
+                  <div className="grid gap-2">
+                    {bookSearchResults.map((r, idx) => {
+                      const title = r.title?.trim()
+                        ? r.title.trim()
+                        : "Untitled";
+                      const author = r.author?.trim()
+                        ? r.author.trim()
+                        : "Unknown author";
+                      const year =
+                        typeof r.firstPublishYear === "number"
+                          ? String(r.firstPublishYear)
+                          : null;
+                      const key = `${r.key ?? "none"}::${idx}`;
+                      const loadingKey = `${bookAddFormat}::${title.toLowerCase()}::${(r.author ?? "").trim().toLowerCase()}`;
+                      return (
+                        <div
+                          key={key}
+                          className="flex flex-col gap-2 rounded-lg border border-zinc-200 bg-white px-3 py-2 text-sm dark:border-zinc-800 dark:bg-black sm:flex-row sm:items-center sm:justify-between"
+                        >
+                          <div className="min-w-0">
+                            <div className="font-medium">{title}</div>
+                            <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                              {author}
+                              {year ? ` • ${year}` : ""}
+                            </div>
+                          </div>
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={!!bookAddLoadingKey}
+                            onClick={() => void onAddBookFromSearch(r)}
+                          >
+                            {bookAddLoadingKey === loadingKey
+                              ? "Adding…"
+                              : "Add"}
+                          </Button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : bookSearchQuery.trim() ? (
+                  <div className="text-xs text-zinc-600 dark:text-zinc-400">
+                    {bookSearchLoading ? "Searching…" : "No results yet."}
+                  </div>
+                ) : null}
+              </div>
+            </div>
+
             <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
               <Button
                 type="button"
                 onClick={() => void onStartReadingSession()}
-                disabled={!plan || working || !!readingSession?.started_at}
+                disabled={
+                  !plan ||
+                  working ||
+                  !!readingSession?.started_at ||
+                  !!readingSession?.ended_at
+                }
               >
                 Start session
               </Button>

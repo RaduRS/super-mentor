@@ -1,7 +1,9 @@
 import { NextResponse } from "next/server";
 import OpenAI from "openai";
+import { Resend } from "resend";
 import { z } from "zod";
 
+import { getRecipeNutrition, searchRecipes } from "@/lib/nutrition/food-api";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
 import {
   computeFreeTimeWindows,
@@ -75,6 +77,48 @@ function safeJsonString(value: unknown): string {
   } catch {
     return "null";
   }
+}
+
+function escapeHtml(value: string) {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+function formatDailyPlanEmailHtml(params: {
+  userName: string;
+  planDate: string;
+  atlasMorningMessage: string;
+}) {
+  const titleName = params.userName.trim() ? params.userName.trim() : "there";
+  const safeMessage = escapeHtml(params.atlasMorningMessage).replaceAll(
+    "\n",
+    "<br />"
+  );
+  const safeDate = escapeHtml(params.planDate);
+  return [
+    "<!doctype html>",
+    "<html>",
+    "<head>",
+    '<meta charset="utf-8" />',
+    '<meta name="viewport" content="width=device-width, initial-scale=1" />',
+    "<title>Daily Plan</title>",
+    "</head>",
+    '<body style="margin:0;background:#0b0b0c;color:#e6e6e6;font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto;">',
+    '<div style="max-width:640px;margin:0 auto;padding:24px;">',
+    `<h1 style="margin:0 0 8px;font-size:20px;line-height:1.2;">Good morning, ${escapeHtml(titleName)}.</h1>`,
+    `<div style="margin:0 0 16px;color:#a1a1aa;font-size:13px;">Your plan for ${safeDate}</div>`,
+    '<div style="background:#111113;border:1px solid #27272a;border-radius:14px;padding:16px;font-size:14px;line-height:1.5;white-space:normal;">',
+    safeMessage,
+    "</div>",
+    '<div style="margin-top:16px;color:#a1a1aa;font-size:12px;">Open the dashboard to log meals, workout, and reading.</div>',
+    "</div>",
+    "</body>",
+    "</html>",
+  ].join("");
 }
 
 type ManagerKey = "forge" | "olive" | "lexicon" | "atlas";
@@ -251,6 +295,122 @@ function normalizeTime(value: string | null | undefined, fallback: string) {
   return `${pad(hh)}:${pad(mm)}:${pad(ss)}`;
 }
 
+function parseNumberAndUnit(input: unknown) {
+  if (typeof input !== "string") return null;
+  const raw = input.trim();
+  if (!raw) return null;
+  const match = raw.match(/^(-?\d+(?:\.\d+)?)(.*)$/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  if (!Number.isFinite(value)) return null;
+  const unit = match[2]?.trim() ?? "";
+  const normalizedUnit = unit
+    .replaceAll("µg", "mcg")
+    .replaceAll("μg", "mcg")
+    .replaceAll("ug", "mcg")
+    .replaceAll(" ", "");
+  return { value, unit: normalizedUnit };
+}
+
+function convertAmount(
+  parsed: { value: number; unit: string },
+  toUnit: "mcg" | "mg" | "g"
+) {
+  const value = parsed.value;
+  const unit = parsed.unit.toLowerCase();
+  if (!Number.isFinite(value)) return null;
+
+  const baseToMcg = () => {
+    if (unit === "mcg") return value;
+    if (unit === "mg") return value * 1000;
+    if (unit === "g") return value * 1_000_000;
+    if (unit === "iu") return value * 0.025;
+    return null;
+  };
+
+  const baseToMg = () => {
+    if (unit === "mg") return value;
+    if (unit === "mcg") return value / 1000;
+    if (unit === "g") return value * 1000;
+    return null;
+  };
+
+  const baseToG = () => {
+    if (unit === "g") return value;
+    if (unit === "mg") return value / 1000;
+    if (unit === "mcg") return value / 1_000_000;
+    return null;
+  };
+
+  if (toUnit === "mcg") return baseToMcg();
+  if (toUnit === "mg") return baseToMg();
+  return baseToG();
+}
+
+function extractNutritionWidgetItems(widget: unknown) {
+  if (!widget || typeof widget !== "object") return [];
+  const record = widget as Record<string, unknown>;
+  const groups = [record.good, record.bad, record.nutrients].filter(Boolean);
+  const items: Array<Record<string, unknown>> = [];
+  for (const group of groups) {
+    if (Array.isArray(group)) {
+      for (const entry of group) {
+        if (entry && typeof entry === "object" && !Array.isArray(entry)) {
+          items.push(entry as Record<string, unknown>);
+        }
+      }
+    }
+  }
+  return items;
+}
+
+function nutritionFromWidget(widget: unknown) {
+  const items = extractNutritionWidgetItems(widget);
+  const pick = (
+    matcher: (title: string) => boolean,
+    toUnit: "mcg" | "mg" | "g"
+  ) => {
+    for (const item of items) {
+      const title = typeof item.title === "string" ? item.title.trim() : "";
+      if (!title) continue;
+      if (!matcher(title)) continue;
+      const parsed = parseNumberAndUnit(item.amount);
+      if (!parsed) continue;
+      const converted = convertAmount(parsed, toUnit);
+      if (
+        typeof converted === "number" &&
+        Number.isFinite(converted) &&
+        converted >= 0
+      ) {
+        return converted;
+      }
+    }
+    return null;
+  };
+
+  const lowerIncludes = (needle: string) => (title: string) =>
+    title.toLowerCase().includes(needle);
+
+  return {
+    fiber_g: pick(
+      (t) => lowerIncludes("fiber")(t) || lowerIncludes("dietary fiber")(t),
+      "g"
+    ),
+    vitamin_b12_mcg: pick((t) => lowerIncludes("vitamin b12")(t), "mcg"),
+    vitamin_d_mcg: pick((t) => lowerIncludes("vitamin d")(t), "mcg"),
+    iron_mg: pick((t) => lowerIncludes("iron")(t), "mg"),
+    calcium_mg: pick((t) => lowerIncludes("calcium")(t), "mg"),
+    magnesium_mg: pick((t) => lowerIncludes("magnesium")(t), "mg"),
+    omega3_g: pick(
+      (t) =>
+        lowerIncludes("omega-3")(t) ||
+        lowerIncludes("omega 3")(t) ||
+        lowerIncludes("omega 3 fatty")(t),
+      "g"
+    ),
+  };
+}
+
 type ScheduleRow = {
   id: string;
   start_date: string | null;
@@ -372,6 +532,40 @@ export async function POST(request: Request) {
       : formatPlanDateInTimeZone(
           (user as { timezone?: unknown } | null)?.timezone as string | null
         );
+
+  const { data: existingPlan } = await supabase
+    .from("daily_plans")
+    .select("id, coordination_log")
+    .eq("user_id", body.userId)
+    .eq("plan_date", planDate)
+    .maybeSingle();
+
+  const existingNotifications =
+    existingPlan &&
+    typeof (existingPlan as { coordination_log?: unknown }).coordination_log ===
+      "object" &&
+    (existingPlan as { coordination_log?: unknown }).coordination_log !==
+      null &&
+    !Array.isArray(
+      (existingPlan as { coordination_log?: unknown }).coordination_log
+    )
+      ? (
+          (existingPlan as { coordination_log?: unknown })
+            .coordination_log as Record<string, unknown>
+        ).notifications
+      : null;
+
+  const existingDailyPlanEmailSentAt =
+    existingNotifications &&
+    typeof existingNotifications === "object" &&
+    !Array.isArray(existingNotifications) &&
+    typeof (existingNotifications as { dailyPlanEmailSentAt?: unknown })
+      .dailyPlanEmailSentAt === "string"
+      ? String(
+          (existingNotifications as { dailyPlanEmailSentAt?: unknown })
+            .dailyPlanEmailSentAt
+        )
+      : null;
 
   const planDayOfWeek = dayOfWeekFromDateOnly(planDate);
 
@@ -528,6 +722,12 @@ export async function POST(request: Request) {
       forgePlan,
       olivePlan,
     },
+    notifications:
+      existingNotifications &&
+      typeof existingNotifications === "object" &&
+      !Array.isArray(existingNotifications)
+        ? existingNotifications
+        : undefined,
   };
 
   let workoutPlanId: string | null = null;
@@ -595,7 +795,7 @@ export async function POST(request: Request) {
       if (!mealPlanError && insertedMealPlan?.id) {
         mealPlanId = String((insertedMealPlan as { id: unknown }).id);
 
-        const mealsToInsert = olivePlan.meals.map((m) => ({
+        const mealsToInsertBase = olivePlan.meals.map((m) => ({
           meal_plan_id: mealPlanId,
           user_id: body.userId,
           meal_type: m.meal_type,
@@ -609,6 +809,52 @@ export async function POST(request: Request) {
           carbs_g: typeof m.carbs_g === "number" ? m.carbs_g : null,
           fats_g: typeof m.fats_g === "number" ? m.fats_g : null,
         }));
+
+        const canEnrich =
+          typeof process.env.SPOONACULAR_API_KEY === "string" &&
+          process.env.SPOONACULAR_API_KEY.trim();
+
+        const mealsToInsert = canEnrich
+          ? await Promise.all(
+              mealsToInsertBase.map(async (meal) => {
+                try {
+                  const results = await searchRecipes({
+                    query: meal.name,
+                    calories:
+                      typeof meal.calories === "number"
+                        ? meal.calories
+                        : undefined,
+                    protein:
+                      typeof meal.protein_g === "number"
+                        ? meal.protein_g
+                        : undefined,
+                    number: 1,
+                  });
+                  const first = Array.isArray(results) ? results[0] : null;
+                  const recipeId =
+                    first && typeof first === "object" && "id" in first
+                      ? Number((first as { id?: unknown }).id)
+                      : null;
+                  if (!recipeId || !Number.isFinite(recipeId)) return meal;
+
+                  const widget = await getRecipeNutrition(recipeId);
+                  const micros = nutritionFromWidget(widget);
+                  return {
+                    ...meal,
+                    fiber_g: micros.fiber_g,
+                    vitamin_b12_mcg: micros.vitamin_b12_mcg,
+                    vitamin_d_mcg: micros.vitamin_d_mcg,
+                    iron_mg: micros.iron_mg,
+                    calcium_mg: micros.calcium_mg,
+                    magnesium_mg: micros.magnesium_mg,
+                    omega3_g: micros.omega3_g,
+                  };
+                } catch {
+                  return meal;
+                }
+              })
+            )
+          : mealsToInsertBase;
 
         if (mealsToInsert.length) {
           await supabase.from("meals").insert(mealsToInsert);
@@ -755,6 +1001,64 @@ export async function POST(request: Request) {
       { ok: false, error: upsertError.message },
       { status: 500 }
     );
+  }
+
+  const userEmail = String((user as { email?: unknown } | null)?.email ?? "");
+  const resendKey =
+    typeof process.env.RESEND_API_KEY === "string"
+      ? process.env.RESEND_API_KEY.trim()
+      : "";
+  const resendFrom =
+    typeof process.env.RESEND_FROM === "string" &&
+    process.env.RESEND_FROM.trim()
+      ? process.env.RESEND_FROM.trim()
+      : "Super Mentor <notifications@supermentor.app>";
+
+  const canSendEmail =
+    !!resendKey &&
+    !!userEmail.trim() &&
+    !!atlasMorningMessage.trim() &&
+    !existingDailyPlanEmailSentAt;
+
+  if (canSendEmail && upserted?.id) {
+    try {
+      const resend = new Resend(resendKey);
+      const { data } = await resend.emails.send({
+        from: resendFrom,
+        to: userEmail,
+        subject: `Your plan for ${planDate}`,
+        html: formatDailyPlanEmailHtml({
+          userName,
+          planDate,
+          atlasMorningMessage,
+        }),
+      });
+
+      const notifications = {
+        ...(existingNotifications &&
+        typeof existingNotifications === "object" &&
+        !Array.isArray(existingNotifications)
+          ? (existingNotifications as Record<string, unknown>)
+          : {}),
+        dailyPlanEmailSentAt: new Date().toISOString(),
+        dailyPlanEmailTo: userEmail,
+        dailyPlanEmailId:
+          data && typeof data === "object" && "id" in data
+            ? (data as { id?: unknown }).id
+            : null,
+      };
+
+      await supabase
+        .from("daily_plans")
+        .update({
+          coordination_log: {
+            ...(coordinationLog as unknown as Record<string, unknown>),
+            notifications,
+          },
+        })
+        .eq("id", String((upserted as { id?: unknown }).id))
+        .eq("user_id", body.userId);
+    } catch {}
   }
 
   return NextResponse.json({ ok: true, dailyPlan: upserted });
