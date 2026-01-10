@@ -19,7 +19,7 @@ export default function ChatPage() {
   if (loading) {
     return (
       <div className="min-h-screen bg-zinc-50 font-sans text-zinc-950 dark:bg-black dark:text-zinc-50">
-        <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16 2xl:max-w-screen-2xl">
+        <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6">
           <Card>
             <CardHeader>
               <CardTitle>Loading…</CardTitle>
@@ -34,7 +34,7 @@ export default function ChatPage() {
   if (!currentUser) {
     return (
       <div className="min-h-screen bg-zinc-50 font-sans text-zinc-950 dark:bg-black dark:text-zinc-50">
-        <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16 2xl:max-w-screen-2xl">
+        <main className="mx-auto flex w-full max-w-4xl flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6">
           <Card>
             <CardHeader>
               <CardTitle>Not logged in</CardTitle>
@@ -53,9 +53,11 @@ export default function ChatPage() {
 
   return (
     <div className="min-h-screen bg-zinc-50 font-sans text-zinc-950 dark:bg-black dark:text-zinc-50">
-      <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16 2xl:max-w-screen-2xl">
+      <main className="mx-auto flex w-full max-w-7xl flex-col gap-6 px-4 py-4 sm:px-6 sm:py-6 2xl:max-w-screen-2xl">
         <AppShell>
-          <ChatInterface userId={currentUser.id} />
+          <div className="mx-auto w-full max-w-4xl">
+            <ChatInterface userId={currentUser.id} />
+          </div>
         </AppShell>
       </main>
     </div>

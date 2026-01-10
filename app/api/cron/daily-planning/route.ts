@@ -411,6 +411,239 @@ function nutritionFromWidget(widget: unknown) {
   };
 }
 
+type ShoppingIngredient = {
+  name: string;
+  quantity: number;
+  unit: string;
+};
+
+type ShoppingListItem = {
+  name: string;
+  totalQuantity: number;
+  unit: string;
+  category: string;
+  estimatedCost: number;
+  checked: boolean;
+};
+
+function normalizeIngredientName(name: string) {
+  return name.trim().replace(/\s+/g, " ");
+}
+
+function parseIngredient(raw: unknown): ShoppingIngredient | null {
+  if (typeof raw === "string") {
+    const name = normalizeIngredientName(raw);
+    if (!name) return null;
+    return { name, quantity: 1, unit: "" };
+  }
+
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const record = raw as Record<string, unknown>;
+  const nameRaw = typeof record.name === "string" ? record.name : "";
+  const name = normalizeIngredientName(nameRaw);
+  if (!name) return null;
+
+  const unit = typeof record.unit === "string" ? record.unit.trim() : "";
+
+  const quantityRaw = record.quantity ?? record.amount ?? record.qty;
+  const quantity =
+    typeof quantityRaw === "number" && Number.isFinite(quantityRaw)
+      ? quantityRaw
+      : typeof quantityRaw === "string" && quantityRaw.trim()
+        ? Number.parseFloat(quantityRaw)
+        : 1;
+
+  return {
+    name,
+    quantity: Number.isFinite(quantity) ? quantity : 1,
+    unit,
+  };
+}
+
+function categorizeIngredient(name: string) {
+  const n = name.toLowerCase();
+
+  const includesAny = (tokens: string[]) => tokens.some((t) => n.includes(t));
+
+  if (
+    includesAny([
+      "apple",
+      "banana",
+      "berries",
+      "blueberr",
+      "strawberr",
+      "raspberr",
+      "spinach",
+      "tomato",
+      "lettuce",
+      "onion",
+      "garlic",
+      "broccoli",
+      "pepper",
+      "cucumber",
+      "carrot",
+      "avocado",
+      "lemon",
+      "lime",
+    ])
+  ) {
+    return "produce";
+  }
+
+  if (
+    includesAny([
+      "chicken",
+      "turkey",
+      "beef",
+      "pork",
+      "lamb",
+      "salmon",
+      "tuna",
+      "cod",
+      "shrimp",
+      "egg",
+    ])
+  ) {
+    return "meat";
+  }
+
+  if (includesAny(["milk", "yogurt", "cheese", "butter", "kefir"])) {
+    return "dairy";
+  }
+
+  if (
+    includesAny([
+      "rice",
+      "quinoa",
+      "oats",
+      "bread",
+      "wrap",
+      "pasta",
+      "tortilla",
+      "flour",
+    ])
+  ) {
+    return "grains";
+  }
+
+  if (
+    includesAny([
+      "olive oil",
+      "oil",
+      "salt",
+      "pepper",
+      "honey",
+      "vinegar",
+      "mustard",
+      "sauce",
+      "spice",
+      "paprika",
+      "cumin",
+      "cinnamon",
+    ])
+  ) {
+    return "pantry";
+  }
+
+  return "other";
+}
+
+function estimateCost(params: {
+  name: string;
+  quantity: number;
+  unit: string;
+}) {
+  const unit = params.unit.toLowerCase();
+  const q = params.quantity;
+  if (!Number.isFinite(q) || q <= 0) return 0;
+
+  const category = categorizeIngredient(params.name);
+  const basePerItem =
+    category === "meat"
+      ? 3.5
+      : category === "dairy"
+        ? 1.5
+        : category === "produce"
+          ? 1.0
+          : category === "grains"
+            ? 0.8
+            : 0.5;
+
+  if (unit === "g") return Math.max(0, (q / 1000) * basePerItem * 3);
+  if (unit === "kg") return Math.max(0, q * basePerItem * 3);
+  if (unit === "ml") return Math.max(0, (q / 1000) * basePerItem * 2);
+  if (unit === "l") return Math.max(0, q * basePerItem * 2);
+
+  return Math.max(0, Math.min(20, q * basePerItem));
+}
+
+function buildShoppingListFromMeals(params: {
+  meals: Array<{ ingredients?: unknown }>;
+}) {
+  const ingredientMap = new Map<
+    string,
+    Omit<ShoppingListItem, "category"> & { category: string }
+  >();
+
+  for (const meal of params.meals) {
+    const ingredients = (meal as { ingredients?: unknown }).ingredients;
+    if (!Array.isArray(ingredients)) continue;
+
+    for (const raw of ingredients) {
+      const parsed = parseIngredient(raw);
+      if (!parsed) continue;
+
+      const nameKey = parsed.name.toLowerCase();
+      const unitKey = parsed.unit.toLowerCase();
+      const key = `${nameKey}::${unitKey}`;
+
+      const category = categorizeIngredient(parsed.name);
+      const estimatedCost = estimateCost({
+        name: parsed.name,
+        quantity: parsed.quantity,
+        unit: parsed.unit,
+      });
+
+      const existing = ingredientMap.get(key);
+      if (existing) {
+        existing.totalQuantity += parsed.quantity;
+        existing.estimatedCost += estimatedCost;
+      } else {
+        ingredientMap.set(key, {
+          name: parsed.name,
+          totalQuantity: parsed.quantity,
+          unit: parsed.unit,
+          category,
+          estimatedCost,
+          checked: false,
+        });
+      }
+    }
+  }
+
+  const grouped = Array.from(ingredientMap.values()).reduce(
+    (acc, item) => {
+      const key = item.category;
+      if (!acc[key]) acc[key] = [];
+      acc[key].push(item);
+      return acc;
+    },
+    {} as Record<string, ShoppingListItem[]>
+  );
+
+  for (const items of Object.values(grouped)) {
+    items.sort((a, b) => a.name.localeCompare(b.name));
+  }
+
+  const totalEstimatedCost = Array.from(ingredientMap.values()).reduce(
+    (sum, item) =>
+      sum + (Number.isFinite(item.estimatedCost) ? item.estimatedCost : 0),
+    0
+  );
+
+  return { items: grouped, totalEstimatedCost };
+}
+
 type ScheduleRow = {
   id: string;
   start_date: string | null;
@@ -858,6 +1091,43 @@ export async function POST(request: Request) {
 
         if (mealsToInsert.length) {
           await supabase.from("meals").insert(mealsToInsert);
+
+          const shopping = buildShoppingListFromMeals({
+            meals: mealsToInsert,
+          });
+
+          if (Object.keys(shopping.items).length) {
+            const { data: existingList } = await supabase
+              .from("shopping_lists")
+              .select("id")
+              .eq("meal_plan_id", mealPlanId)
+              .eq("user_id", body.userId)
+              .order("created_at", { ascending: false })
+              .limit(1)
+              .maybeSingle();
+
+            if (existingList?.id) {
+              await supabase
+                .from("shopping_lists")
+                .update({
+                  shopping_date: planDate,
+                  items: shopping.items,
+                  total_estimated_cost: shopping.totalEstimatedCost,
+                  completed: false,
+                  completed_at: null,
+                })
+                .eq("id", String((existingList as { id?: unknown }).id))
+                .eq("user_id", body.userId);
+            } else {
+              await supabase.from("shopping_lists").insert({
+                meal_plan_id: mealPlanId,
+                user_id: body.userId,
+                shopping_date: planDate,
+                items: shopping.items,
+                total_estimated_cost: shopping.totalEstimatedCost,
+              });
+            }
+          }
         }
       }
     } catch {}

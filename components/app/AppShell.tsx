@@ -20,8 +20,23 @@ const NavItems: NavItem[] = [
   },
   {
     label: "Schedule",
-    href: "/dashboard#schedule",
-    activeWhen: (p) => p.startsWith("/dashboard"),
+    href: "/dashboard/schedule",
+    activeWhen: (p) => p.startsWith("/dashboard/schedule"),
+  },
+  {
+    label: "Workout",
+    href: "/dashboard/workout",
+    activeWhen: (p) => p.startsWith("/dashboard/workout"),
+  },
+  {
+    label: "Meals",
+    href: "/dashboard/meals",
+    activeWhen: (p) => p.startsWith("/dashboard/meals"),
+  },
+  {
+    label: "Reading",
+    href: "/dashboard/reading",
+    activeWhen: (p) => p.startsWith("/dashboard/reading"),
   },
   { label: "Chat", href: "/chat", activeWhen: (p) => p.startsWith("/chat") },
   {

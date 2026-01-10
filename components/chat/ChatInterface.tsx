@@ -18,6 +18,25 @@ type ConversationRow = {
   content: string;
 };
 
+function getCoordinationSuggestion(
+  log: unknown,
+  manager: "forge" | "olive" | "lexicon"
+) {
+  if (!log || typeof log !== "object" || Array.isArray(log)) return null;
+  const entry = (log as Record<string, unknown>)[manager];
+  if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+  const suggestion = (entry as Record<string, unknown>).suggestion;
+  if (typeof suggestion !== "string") return null;
+  return suggestion.trim() ? suggestion : null;
+}
+
+function getCoordinationPlanDate(log: unknown) {
+  if (!log || typeof log !== "object" || Array.isArray(log)) return null;
+  const v = (log as Record<string, unknown>).planDate;
+  if (typeof v !== "string") return null;
+  return v.trim() ? v.trim() : null;
+}
+
 const Managers: Array<{
   key: ManagerKey;
   name: string;
@@ -58,6 +77,7 @@ export function ChatInterface(props: { userId: string }) {
   const searchParams = useSearchParams();
   const [activeManager, setActiveManager] = useState<ManagerKey>("atlas");
   const [messages, setMessages] = useState<ConversationRow[]>([]);
+  const [coordinationLog, setCoordinationLog] = useState<unknown>(null);
   const [loading, setLoading] = useState(false);
   const [sending, setSending] = useState(false);
   const [draft, setDraft] = useState("");
@@ -100,6 +120,32 @@ export function ChatInterface(props: { userId: string }) {
     }
 
     void load();
+  }, [activeManager, supabase, userId]);
+
+  useEffect(() => {
+    if (activeManager !== "atlas") {
+      setCoordinationLog(null);
+      return;
+    }
+
+    async function loadCoordinationLog() {
+      const { data, error } = await supabase
+        .from("daily_plans")
+        .select("plan_date, coordination_log")
+        .eq("user_id", userId)
+        .order("plan_date", { ascending: false })
+        .limit(1)
+        .maybeSingle();
+
+      if (error) return;
+      setCoordinationLog(
+        data && typeof data === "object" && "coordination_log" in data
+          ? ((data as { coordination_log?: unknown }).coordination_log ?? null)
+          : null
+      );
+    }
+
+    void loadCoordinationLog();
   }, [activeManager, supabase, userId]);
 
   const sendText = useCallback(
@@ -150,6 +196,17 @@ export function ChatInterface(props: { userId: string }) {
         if (!reply.trim()) {
           toast.error("Empty reply");
           return;
+        }
+
+        const nextCoordinationLog =
+          typeof payload === "object" &&
+          payload !== null &&
+          "coordinationLog" in payload
+            ? (payload as { coordinationLog?: unknown }).coordinationLog
+            : null;
+
+        if (activeManager === "atlas" && nextCoordinationLog) {
+          setCoordinationLog(nextCoordinationLog);
         }
 
         const savedUser =
@@ -258,54 +315,43 @@ export function ChatInterface(props: { userId: string }) {
     })();
   }, [activeManager, loading, pendingAutoSend, sending, sendText]);
 
+  const lastAssistantMessageId = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i]?.role === "assistant") return messages[i].id;
+    }
+    return null;
+  }, [messages]);
+
+  const planDate = useMemo(
+    () => getCoordinationPlanDate(coordinationLog),
+    [coordinationLog]
+  );
+  const forgeSuggestion = useMemo(
+    () => getCoordinationSuggestion(coordinationLog, "forge"),
+    [coordinationLog]
+  );
+  const oliveSuggestion = useMemo(
+    () => getCoordinationSuggestion(coordinationLog, "olive"),
+    [coordinationLog]
+  );
+  const lexiconSuggestion = useMemo(
+    () => getCoordinationSuggestion(coordinationLog, "lexicon"),
+    [coordinationLog]
+  );
+  const hasCoordinationSuggestions = !!(
+    forgeSuggestion ||
+    oliveSuggestion ||
+    lexiconSuggestion
+  );
+
   return (
     <Card className="overflow-hidden">
       <CardHeader className="pb-4">
         <CardTitle>Chat</CardTitle>
       </CardHeader>
 
-      <CardContent className="grid gap-4 lg:grid-cols-[260px_1fr]">
-        <div className="flex flex-col gap-2">
-          <div className="text-sm font-medium text-zinc-700 dark:text-zinc-300">
-            Managers
-          </div>
-
-          <div className="flex gap-2 overflow-x-auto pb-1 lg:flex-col lg:overflow-visible lg:pb-0">
-            {Managers.map((m) => {
-              const active = m.key === activeManager;
-              return (
-                <button
-                  key={m.key}
-                  type="button"
-                  onClick={() => setActiveManager(m.key)}
-                  className={
-                    "min-w-[180px] rounded-xl border px-3 py-2 text-left text-sm lg:min-w-0 " +
-                    (active
-                      ? "border-zinc-300 bg-zinc-100 dark:border-zinc-700 dark:bg-zinc-900"
-                      : "border-zinc-200 bg-white hover:bg-zinc-50 dark:border-zinc-800 dark:bg-black dark:hover:bg-zinc-950")
-                  }
-                >
-                  <div className="flex items-center justify-between gap-3">
-                    <div className="font-semibold">{m.name}</div>
-                    <div
-                      className={
-                        "size-2 rounded-full " +
-                        (active
-                          ? "bg-emerald-500"
-                          : "bg-zinc-300 dark:bg-zinc-700")
-                      }
-                    />
-                  </div>
-                  <div className="mt-1 line-clamp-2 text-xs text-zinc-600 dark:text-zinc-400">
-                    {m.description}
-                  </div>
-                </button>
-              );
-            })}
-          </div>
-        </div>
-
-        <div className="flex min-h-[520px] flex-col rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-black">
+      <CardContent className="flex flex-col gap-4">
+        <div className="flex min-h-[360px] max-h-[calc(100svh-220px)] min-w-0 flex-col rounded-xl border border-zinc-200 bg-white sm:min-h-[520px] dark:border-zinc-800 dark:bg-black">
           <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
             {loading ? (
               <div className="text-sm text-zinc-600 dark:text-zinc-400">
@@ -336,6 +382,51 @@ export function ChatInterface(props: { userId: string }) {
                         }
                       >
                         <div className="whitespace-pre-wrap">{m.content}</div>
+                        {!isUser &&
+                        activeManager === "atlas" &&
+                        m.id === lastAssistantMessageId &&
+                        hasCoordinationSuggestions ? (
+                          <details className="mt-3 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-sm dark:border-zinc-800 dark:bg-black">
+                            <summary className="cursor-pointer select-none font-medium">
+                              View planning conversation
+                              {planDate ? ` (${planDate})` : ""}
+                            </summary>
+                            <div className="mt-3 grid gap-3">
+                              {forgeSuggestion ? (
+                                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950">
+                                  <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                                    Forge
+                                  </div>
+                                  <div className="mt-1 whitespace-pre-wrap text-sm">
+                                    {forgeSuggestion}
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {oliveSuggestion ? (
+                                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950">
+                                  <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                                    Olive
+                                  </div>
+                                  <div className="mt-1 whitespace-pre-wrap text-sm">
+                                    {oliveSuggestion}
+                                  </div>
+                                </div>
+                              ) : null}
+
+                              {lexiconSuggestion ? (
+                                <div className="rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-2 dark:border-zinc-800 dark:bg-zinc-950">
+                                  <div className="text-xs font-semibold text-zinc-700 dark:text-zinc-300">
+                                    Lexicon
+                                  </div>
+                                  <div className="mt-1 whitespace-pre-wrap text-sm">
+                                    {lexiconSuggestion}
+                                  </div>
+                                </div>
+                              ) : null}
+                            </div>
+                          </details>
+                        ) : null}
                         <div
                           className={
                             "mt-2 text-xs " +
@@ -375,14 +466,35 @@ export function ChatInterface(props: { userId: string }) {
                   placeholder="Type your message…"
                 />
               </div>
-              <Button
-                type="button"
-                onClick={() => void onSend()}
-                disabled={sending || !draft.trim()}
-                className="sm:w-28"
-              >
-                {sending ? "Sending…" : "Send"}
-              </Button>
+              <div className="flex gap-2 sm:items-end">
+                <div className="sm:w-44">
+                  <label className="text-xs font-medium text-zinc-600 dark:text-zinc-400">
+                    Manager
+                  </label>
+                  <select
+                    value={activeManager}
+                    onChange={(e) =>
+                      setActiveManager(e.target.value as ManagerKey)
+                    }
+                    disabled={sending}
+                    className="mt-1 h-9 w-full rounded-md border border-input bg-background px-3 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-ring/50 focus-visible:ring-[3px] disabled:cursor-not-allowed disabled:opacity-60 dark:bg-input/30"
+                  >
+                    {Managers.map((m) => (
+                      <option key={m.key} value={m.key}>
+                        {m.name}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <Button
+                  type="button"
+                  onClick={() => void onSend()}
+                  disabled={sending || !draft.trim()}
+                  className="h-9 sm:w-28"
+                >
+                  {sending ? "Sending…" : "Send"}
+                </Button>
+              </div>
             </div>
           </div>
         </div>

@@ -4,7 +4,12 @@ import { z } from "zod";
 
 import { generateEmbedding, semanticSearch } from "@/lib/ai/embeddings";
 import { getSupabaseAdmin } from "@/lib/supabase/admin";
-import { dayOfWeekFromDateOnly, parseTimeToMinutes } from "@/lib/utils";
+import {
+  computeFreeTimeWindows,
+  dayOfWeekFromDateOnly,
+  minutesToTime,
+  parseTimeToMinutes,
+} from "@/lib/utils";
 
 const ChatBodySchema = z.object({
   userId: z.string().min(1),
@@ -19,6 +24,74 @@ type ConversationRow = {
   role: "user" | "assistant" | "system";
   content: string;
 };
+
+function parseMealSwapSelection(text: string) {
+  const raw = text.trim().toLowerCase();
+  if (!raw) return null;
+  if (raw === "1" || raw === "2" || raw === "3") return Number(raw);
+  const match = raw.match(/\b(?:option|number|num|numer)\s*([123])\b/);
+  if (!match) return null;
+  const n = Number(match[1]);
+  return n >= 1 && n <= 3 ? n : null;
+}
+
+function extractTagValue(text: string, tag: string) {
+  const match = text.match(new RegExp(`${tag}=([^\\s]+)`, "i"));
+  if (!match) return null;
+  const v = String(match[1] ?? "").trim();
+  return v ? v : null;
+}
+
+function parseMealOptions(text: string) {
+  const results = new Map<
+    number,
+    {
+      name: string;
+      calories: number | null;
+      protein_g: number | null;
+      carbs_g: number | null;
+      fats_g: number | null;
+    }
+  >();
+
+  const optionHeaderRegex = /^(\s*)Option\s*([123])\s*[–-]\s*(.+?)\s*$/gim;
+  const matches = Array.from(text.matchAll(optionHeaderRegex));
+  for (let i = 0; i < matches.length; i += 1) {
+    const m = matches[i];
+    const num = Number(m[2]);
+    const name = String(m[3] ?? "").trim();
+    if (!name || !(num >= 1 && num <= 3)) continue;
+
+    const start = (m.index ?? 0) + String(m[0] ?? "").length;
+    const end =
+      i + 1 < matches.length
+        ? (matches[i + 1]?.index ?? text.length)
+        : text.length;
+    const block = text.slice(start, end);
+
+    const macrosMatch = block.match(
+      /(\d+(?:\.\d+)?)\s*kcal\s*\|\s*(\d+(?:\.\d+)?)\s*P\s*\|\s*(\d+(?:\.\d+)?)\s*C\s*\|\s*(\d+(?:\.\d+)?)\s*F/i
+    );
+    const calories = macrosMatch ? Number(macrosMatch[1]) : null;
+    const protein_g = macrosMatch ? Number(macrosMatch[2]) : null;
+    const carbs_g = macrosMatch ? Number(macrosMatch[3]) : null;
+    const fats_g = macrosMatch ? Number(macrosMatch[4]) : null;
+
+    results.set(num, {
+      name,
+      calories: Number.isFinite(calories as number)
+        ? (calories as number)
+        : null,
+      protein_g: Number.isFinite(protein_g as number)
+        ? (protein_g as number)
+        : null,
+      carbs_g: Number.isFinite(carbs_g as number) ? (carbs_g as number) : null,
+      fats_g: Number.isFinite(fats_g as number) ? (fats_g as number) : null,
+    });
+  }
+
+  return results;
+}
 
 const DateOnlySchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 const TimeHHMMSchema = z
@@ -78,6 +151,29 @@ const ScheduleDeleteArgsSchema = z.object({
   scheduleId: z.string().min(1),
 });
 
+const ScheduleActionBodySchema = z.discriminatedUnion("action", [
+  z.object({
+    action: z.literal("schedule_create"),
+    userId: z.string().min(1),
+    args: ScheduleCreateArgsSchema,
+  }),
+  z.object({
+    action: z.literal("schedule_update"),
+    userId: z.string().min(1),
+    args: ScheduleUpdateArgsSchema,
+  }),
+  z.object({
+    action: z.literal("schedule_delete"),
+    userId: z.string().min(1),
+    args: ScheduleDeleteArgsSchema,
+  }),
+  z.object({
+    action: z.literal("schedule_list"),
+    userId: z.string().min(1),
+    args: ScheduleListArgsSchema.optional().default({}),
+  }),
+]);
+
 const MealTypeSchema = z.enum(["breakfast", "lunch", "dinner", "snack"]);
 
 const MealSwapArgsSchema = z
@@ -93,9 +189,17 @@ const MealSwapArgsSchema = z
     carbs_g: z.number().min(0).optional(),
     fats_g: z.number().min(0).optional(),
   })
-  .refine((v) => !!v.mealId || (!!v.mealType && !!v.scheduledDate), {
-    message: "Provide mealId, or mealType+scheduledDate",
-  });
+  .refine(
+    (v) =>
+      !!v.mealId ||
+      (!!v.mealType &&
+        !!v.scheduledDate &&
+        (!!v.scheduledTime || !!v.oldMealName)),
+    {
+      message:
+        "Provide mealId, or mealType+scheduledDate+(scheduledTime or oldMealName)",
+    }
+  );
 
 function formatPlanDateInTimeZone(timeZone: string | null | undefined) {
   const tz =
@@ -106,6 +210,18 @@ function formatPlanDateInTimeZone(timeZone: string | null | undefined) {
     month: "2-digit",
     day: "2-digit",
   }).format(new Date());
+}
+
+function normalizeHHMM(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  const match = trimmed.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (!match) return null;
+  const hh = Math.min(23, Math.max(0, Number(match[1])));
+  const mm = Math.min(59, Math.max(0, Number(match[2])));
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return null;
+  return `${String(hh).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
 }
 
 function getCategoryForManager(
@@ -489,7 +605,17 @@ function buildMealTools() {
         parameters: {
           type: "object",
           additionalProperties: false,
-          required: ["newMealName"],
+          anyOf: [
+            { required: ["mealId", "newMealName"] },
+            {
+              required: [
+                "mealType",
+                "scheduledDate",
+                "scheduledTime",
+                "newMealName",
+              ],
+            },
+          ],
           properties: {
             mealId: { type: "string", description: "Existing meal row id" },
             mealType: {
@@ -556,6 +682,337 @@ function filterScheduleRowsForDateOnly(params: {
     .filter((row) => !!row.start_time && !!row.end_time);
 }
 
+function overlapsMinutes(params: {
+  aStart: number;
+  aEnd: number;
+  bStart: number;
+  bEnd: number;
+}) {
+  return params.aStart < params.bEnd && params.aEnd > params.bStart;
+}
+
+function pickFirstStartTimeInWindows(params: {
+  windows: Array<{ startTime: string; endTime: string }>;
+  minDurationMinutes: number;
+  notBeforeMinutes: number;
+}) {
+  const minDuration = Math.max(1, Math.round(params.minDurationMinutes));
+  const notBefore = Math.max(0, Math.round(params.notBeforeMinutes));
+
+  for (const w of params.windows) {
+    const wStart = parseTimeToMinutes(w.startTime);
+    const wEnd = parseTimeToMinutes(w.endTime);
+    if (wStart === null || wEnd === null) continue;
+    const start = Math.max(wStart, notBefore);
+    if (wEnd - start >= minDuration) return minutesToTime(start);
+  }
+  return null;
+}
+
+async function autoReschedulePlanAroundScheduleBlock(params: {
+  supabase: ReturnType<typeof getSupabaseAdmin>;
+  userId: string;
+  planDate: string;
+  conflictStartMin: number;
+  conflictEndMin: number;
+  scheduleRangeStart: string;
+  scheduleRangeEnd: string;
+  scheduleRowsForDate: Array<Record<string, unknown>>;
+}) {
+  const { data: plan } = await params.supabase
+    .from("daily_plans")
+    .select("id, workout_plan_id, meal_plan_id, reading_goal_id")
+    .eq("user_id", params.userId)
+    .eq("plan_date", params.planDate)
+    .maybeSingle();
+
+  if (!plan?.id) return null;
+
+  const workoutPlanId = plan.workout_plan_id
+    ? String((plan as { workout_plan_id?: unknown }).workout_plan_id)
+    : null;
+  const mealPlanId = plan.meal_plan_id
+    ? String((plan as { meal_plan_id?: unknown }).meal_plan_id)
+    : null;
+  const readingSessionId = plan.reading_goal_id
+    ? String((plan as { reading_goal_id?: unknown }).reading_goal_id)
+    : null;
+
+  const rescheduled: {
+    workout?: { from: string; to: string };
+    meals?: Array<{ id: string; from: string; to: string }>;
+    reading?: { from: string; to: string };
+  } = {};
+
+  const busyForRescheduling = params.scheduleRowsForDate
+    .map((e) => ({
+      startMin: parseTimeToMinutes(
+        typeof e.start_time === "string" ? e.start_time : null
+      ),
+      endMin: parseTimeToMinutes(
+        typeof e.end_time === "string" ? e.end_time : null
+      ),
+    }))
+    .filter(
+      (w): w is { startMin: number; endMin: number } =>
+        typeof w.startMin === "number" &&
+        Number.isFinite(w.startMin) &&
+        typeof w.endMin === "number" &&
+        Number.isFinite(w.endMin)
+    );
+
+  const addBusy = (startMin: number, endMin: number) => {
+    if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) return;
+    if (endMin <= startMin) return;
+    busyForRescheduling.push({ startMin, endMin });
+  };
+
+  const computeWindowsWithBusy = () =>
+    computeFreeTimeWindows({
+      busy: busyForRescheduling.map((b) => ({
+        startTime: minutesToTime(b.startMin),
+        endTime: minutesToTime(b.endMin),
+      })),
+      rangeStartTime: params.scheduleRangeStart,
+      rangeEndTime: params.scheduleRangeEnd,
+    });
+
+  if (workoutPlanId) {
+    const { data: workoutPlan } = await params.supabase
+      .from("workout_plans")
+      .select("id, scheduled_time, total_duration_minutes, completed")
+      .eq("id", workoutPlanId)
+      .eq("user_id", params.userId)
+      .maybeSingle();
+
+    const isCompleted =
+      typeof (workoutPlan as { completed?: unknown } | null)?.completed ===
+      "boolean"
+        ? Boolean((workoutPlan as { completed?: unknown } | null)?.completed)
+        : false;
+
+    const startMin = parseTimeToMinutes(
+      typeof (workoutPlan as { scheduled_time?: unknown } | null)
+        ?.scheduled_time === "string"
+        ? String(
+            (workoutPlan as { scheduled_time?: unknown } | null)?.scheduled_time
+          )
+        : null
+    );
+    const duration =
+      typeof (workoutPlan as { total_duration_minutes?: unknown } | null)
+        ?.total_duration_minutes === "number"
+        ? Math.max(
+            10,
+            Math.min(
+              240,
+              Number(
+                (workoutPlan as { total_duration_minutes?: unknown } | null)
+                  ?.total_duration_minutes
+              )
+            )
+          )
+        : 45;
+
+    if (!isCompleted && startMin !== null) {
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: params.conflictStartMin,
+          bEnd: params.conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: params.conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+
+        if (picked) {
+          const pickedMin = parseTimeToMinutes(picked);
+          if (pickedMin !== null) {
+            const from = minutesToTime(startMin);
+            const to = picked;
+            const { error: updateWorkoutError } = await params.supabase
+              .from("workout_plans")
+              .update({ scheduled_time: toHHMMSS(to) })
+              .eq("id", workoutPlanId)
+              .eq("user_id", params.userId);
+            if (!updateWorkoutError) {
+              rescheduled.workout = { from, to };
+              addBusy(pickedMin, pickedMin + duration);
+            }
+          }
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (mealPlanId) {
+    const { data: meals } = await params.supabase
+      .from("meals")
+      .select(
+        "id, scheduled_time, scheduled_date, status, actually_eaten, logged_at"
+      )
+      .eq("meal_plan_id", mealPlanId)
+      .eq("user_id", params.userId)
+      .eq("scheduled_date", params.planDate)
+      .eq("status", "active");
+
+    const rows = ((meals as unknown[] | null) ?? []) as Array<
+      Record<string, unknown>
+    >;
+    for (const meal of rows) {
+      const id = String(meal.id ?? "");
+      if (!id) continue;
+      const alreadyEaten =
+        meal.actually_eaten === true || typeof meal.logged_at === "string";
+      if (alreadyEaten) continue;
+      const startMin = parseTimeToMinutes(
+        typeof meal.scheduled_time === "string"
+          ? String(meal.scheduled_time)
+          : null
+      );
+      if (startMin === null) continue;
+      const duration = 30;
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: params.conflictStartMin,
+          bEnd: params.conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: params.conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+        if (!picked) continue;
+        const pickedMin = parseTimeToMinutes(picked);
+        if (pickedMin === null) continue;
+        const from = minutesToTime(startMin);
+        const to = picked;
+        const { error: updateMealError } = await params.supabase
+          .from("meals")
+          .update({ scheduled_time: toHHMMSS(to) })
+          .eq("id", id)
+          .eq("user_id", params.userId);
+        if (!updateMealError) {
+          rescheduled.meals = rescheduled.meals ?? [];
+          rescheduled.meals.push({ id, from, to });
+          addBusy(pickedMin, pickedMin + duration);
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (readingSessionId) {
+    const { data: readingSession } = await params.supabase
+      .from("reading_sessions")
+      .select("id, scheduled_time, duration_minutes, ended_at")
+      .eq("id", readingSessionId)
+      .eq("user_id", params.userId)
+      .maybeSingle();
+
+    const isDone = !!(readingSession as { ended_at?: unknown } | null)
+      ?.ended_at;
+    const startMin = parseTimeToMinutes(
+      typeof (readingSession as { scheduled_time?: unknown } | null)
+        ?.scheduled_time === "string"
+        ? String(
+            (readingSession as { scheduled_time?: unknown } | null)
+              ?.scheduled_time
+          )
+        : null
+    );
+    const duration =
+      typeof (readingSession as { duration_minutes?: unknown } | null)
+        ?.duration_minutes === "number"
+        ? Math.max(
+            10,
+            Math.min(
+              180,
+              Number(
+                (readingSession as { duration_minutes?: unknown } | null)
+                  ?.duration_minutes
+              )
+            )
+          )
+        : 25;
+
+    if (!isDone && startMin !== null) {
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: params.conflictStartMin,
+          bEnd: params.conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: params.conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+        if (picked) {
+          const pickedMin = parseTimeToMinutes(picked);
+          if (pickedMin !== null) {
+            const from = minutesToTime(startMin);
+            const to = picked;
+            const { error: updateReadingError } = await params.supabase
+              .from("reading_sessions")
+              .update({ scheduled_time: toHHMMSS(to) })
+              .eq("id", readingSessionId)
+              .eq("user_id", params.userId);
+            if (!updateReadingError) {
+              rescheduled.reading = { from, to };
+              addBusy(pickedMin, pickedMin + duration);
+            }
+          }
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (rescheduled.workout || rescheduled.reading || rescheduled.meals?.length) {
+    return { planDate: params.planDate, rescheduled } as const;
+  }
+
+  return null;
+}
+
 async function scheduleCreateOneOff(params: {
   supabase: ReturnType<typeof getSupabaseAdmin>;
   userId: string;
@@ -576,21 +1033,197 @@ async function scheduleCreateOneOff(params: {
     rows: allRows,
     dateOnly: params.args.date,
   });
-  const hasOverlap = todays.some((row) => {
-    const busyStart = parseTimeToMinutes(
-      typeof row.start_time === "string" ? row.start_time : null
+  const conflicts = todays
+    .map((row) => {
+      const busyStart = parseTimeToMinutes(
+        typeof row.start_time === "string" ? row.start_time : null
+      );
+      const busyEnd = parseTimeToMinutes(
+        typeof row.end_time === "string" ? row.end_time : null
+      );
+      if (busyStart === null || busyEnd === null) return null;
+      const overlaps = startMin < busyEnd && endMin > busyStart;
+      if (!overlaps) return null;
+      return { row, busyStart, busyEnd };
+    })
+    .filter(Boolean) as Array<{
+    row: Record<string, unknown>;
+    busyStart: number;
+    busyEnd: number;
+  }>;
+
+  const { data: user } = await params.supabase
+    .from("users")
+    .select("sleep_schedule")
+    .eq("id", params.userId)
+    .maybeSingle();
+
+  const sleepObject =
+    user &&
+    typeof (user as { sleep_schedule?: unknown }).sleep_schedule === "object"
+      ? ((user as { sleep_schedule?: unknown }).sleep_schedule as Record<
+          string,
+          unknown
+        >)
+      : null;
+  const scheduleRangeStart =
+    normalizeHHMM(sleepObject?.typicalWakeTime) ?? "06:00";
+  const scheduleRangeEnd =
+    normalizeHHMM(sleepObject?.typicalBedtime) ?? "23:00";
+
+  if (conflicts.length) {
+    const hardEventTypes = new Set(["work", "meeting", "appointment", "sleep"]);
+    const softEventTypes = new Set(["meal", "workout", "reading", "free_time"]);
+
+    const classifyConflict = (row: Record<string, unknown>) => {
+      const specificDate =
+        typeof row.specific_date === "string" ? row.specific_date : null;
+      const isOneOffForDate = specificDate === params.args.date;
+
+      const scheduleType =
+        typeof row.schedule_type === "string" ? row.schedule_type : null;
+      const eventType =
+        typeof row.event_type === "string" ? row.event_type : null;
+
+      const isExplicitInflexible = row.is_flexible === false;
+      const isSoftType = eventType ? softEventTypes.has(eventType) : false;
+      const isShiftableOneOff =
+        isOneOffForDate && isSoftType && row.is_flexible !== false;
+
+      const isHard =
+        isExplicitInflexible ||
+        scheduleType === "work" ||
+        (eventType ? hardEventTypes.has(eventType) : false);
+
+      const isSoftRecurring =
+        !isOneOffForDate && isSoftType && row.is_flexible !== false;
+
+      if (isHard) return "hard" as const;
+      if (isShiftableOneOff) return "shiftable" as const;
+      if (isSoftRecurring) return "soft_recurring" as const;
+      return "hard" as const;
+    };
+
+    const hardConflicts = conflicts.filter(
+      (c) => classifyConflict(c.row) === "hard"
     );
-    const busyEnd = parseTimeToMinutes(
-      typeof row.end_time === "string" ? row.end_time : null
+    const shiftableConflicts = conflicts.filter(
+      (c) => classifyConflict(c.row) === "shiftable"
     );
-    if (busyStart === null || busyEnd === null) return false;
-    return startMin < busyEnd && endMin > busyStart;
-  });
-  if (hasOverlap) {
-    return {
-      ok: false,
-      error: "Time overlaps an existing schedule block.",
-    } as const;
+
+    if (hardConflicts.length) {
+      return {
+        ok: false,
+        error: "Time overlaps an existing schedule block.",
+      } as const;
+    }
+
+    const busyForShifting =
+      shiftableConflicts.length > 0
+        ? todays
+            .filter((row) => {
+              const id = String(row.id ?? "");
+              return !shiftableConflicts.some(
+                (c) => String(c.row.id ?? "") === id
+              );
+            })
+            .map((row) => ({
+              startMin: parseTimeToMinutes(
+                typeof row.start_time === "string" ? row.start_time : null
+              ),
+              endMin: parseTimeToMinutes(
+                typeof row.end_time === "string" ? row.end_time : null
+              ),
+            }))
+            .filter(
+              (w): w is { startMin: number; endMin: number } =>
+                typeof w.startMin === "number" &&
+                Number.isFinite(w.startMin) &&
+                typeof w.endMin === "number" &&
+                Number.isFinite(w.endMin)
+            )
+        : [];
+
+    if (shiftableConflicts.length > 0) {
+      busyForShifting.push({ startMin, endMin });
+    }
+
+    const moved: Array<{ id: string; from: string; to: string }> = [];
+
+    const addBusy = (s: number, e: number) => {
+      if (!Number.isFinite(s) || !Number.isFinite(e)) return;
+      if (e <= s) return;
+      busyForShifting.push({ startMin: s, endMin: e });
+    };
+
+    const computeWindows = () =>
+      computeFreeTimeWindows({
+        busy: busyForShifting.map((b) => ({
+          startTime: minutesToTime(b.startMin),
+          endTime: minutesToTime(b.endMin),
+        })),
+        rangeStartTime: scheduleRangeStart,
+        rangeEndTime: scheduleRangeEnd,
+      });
+
+    const ordered = shiftableConflicts
+      .slice()
+      .sort((a, b) => a.busyStart - b.busyStart || a.busyEnd - b.busyEnd);
+
+    for (const c of ordered) {
+      const duration = c.busyEnd - c.busyStart;
+      const windows = computeWindows();
+      const picked =
+        pickFirstStartTimeInWindows({
+          windows,
+          minDurationMinutes: duration,
+          notBeforeMinutes: endMin,
+        }) ??
+        pickFirstStartTimeInWindows({
+          windows,
+          minDurationMinutes: duration,
+          notBeforeMinutes: 0,
+        });
+
+      if (!picked) {
+        return {
+          ok: false,
+          error: "Time overlaps an existing schedule block.",
+        } as const;
+      }
+
+      const pickedMin = parseTimeToMinutes(picked);
+      if (pickedMin === null) {
+        return {
+          ok: false,
+          error: "Time overlaps an existing schedule block.",
+        } as const;
+      }
+
+      const newEndMin = pickedMin + duration;
+      const { error: shiftError } = await params.supabase
+        .from("user_schedules")
+        .update({
+          start_time: toHHMMSS(picked),
+          end_time: toHHMMSS(minutesToTime(newEndMin)),
+        })
+        .eq("id", String(c.row.id ?? ""))
+        .eq("user_id", params.userId);
+
+      if (shiftError) {
+        return {
+          ok: false,
+          error: "Time overlaps an existing schedule block.",
+        } as const;
+      }
+
+      moved.push({
+        id: String(c.row.id ?? ""),
+        from: minutesToTime(c.busyStart),
+        to: picked,
+      });
+      addBusy(pickedMin, newEndMin);
+    }
   }
 
   const { data: inserted, error } = await params.supabase
@@ -603,8 +1236,8 @@ async function scheduleCreateOneOff(params: {
       start_date: params.args.date,
       end_date: params.args.date,
       specific_date: params.args.date,
-      start_time: params.args.startTime,
-      end_time: params.args.endTime,
+      start_time: toHHMMSS(params.args.startTime),
+      end_time: toHHMMSS(params.args.endTime),
       is_flexible: params.args.isFlexible,
       priority: params.args.priority,
     })
@@ -613,6 +1246,36 @@ async function scheduleCreateOneOff(params: {
 
   if (error || !inserted?.id) {
     return { ok: false, error: error?.message ?? "Insert failed" } as const;
+  }
+
+  const rowsAfterInsert = await getScheduleRowsForUser({
+    supabase: params.supabase,
+    userId: params.userId,
+    limit: 800,
+  }).catch(() => []);
+  const scheduleRowsForDate = filterScheduleRowsForDateOnly({
+    rows: rowsAfterInsert,
+    dateOnly: params.args.date,
+  });
+
+  const planRescheduled = await autoReschedulePlanAroundScheduleBlock({
+    supabase: params.supabase,
+    userId: params.userId,
+    planDate: params.args.date,
+    conflictStartMin: startMin,
+    conflictEndMin: endMin,
+    scheduleRangeStart,
+    scheduleRangeEnd,
+    scheduleRowsForDate,
+  }).catch(() => null);
+
+  if (planRescheduled?.rescheduled) {
+    return {
+      ok: true,
+      scheduleId: String((inserted as { id: unknown }).id),
+      planDate: planRescheduled.planDate,
+      rescheduled: planRescheduled.rescheduled,
+    } as const;
   }
 
   return {
@@ -648,7 +1311,9 @@ async function scheduleUpdate(params: {
 
   const { data: existing } = await params.supabase
     .from("user_schedules")
-    .select("id")
+    .select(
+      "id, start_date, end_date, schedule_type, days_of_week, event_type, start_time, end_time, specific_date, title, is_flexible, priority"
+    )
     .eq("id", params.args.scheduleId)
     .eq("user_id", params.userId)
     .maybeSingle();
@@ -665,6 +1330,376 @@ async function scheduleUpdate(params: {
 
   if (error) {
     return { ok: false, error: error.message } as const;
+  }
+
+  const { data: user } = await params.supabase
+    .from("users")
+    .select("timezone, sleep_schedule")
+    .eq("id", params.userId)
+    .maybeSingle();
+
+  const timeZone =
+    typeof (user as { timezone?: unknown } | null)?.timezone === "string"
+      ? String((user as { timezone?: unknown } | null)?.timezone)
+      : null;
+  const todayDate = formatPlanDateInTimeZone(timeZone);
+
+  const { data: updatedRow } = await params.supabase
+    .from("user_schedules")
+    .select(
+      "id, start_date, end_date, schedule_type, days_of_week, event_type, start_time, end_time, specific_date, title, is_flexible, priority"
+    )
+    .eq("id", params.args.scheduleId)
+    .eq("user_id", params.userId)
+    .maybeSingle();
+
+  const scheduleRowsForContext = await getScheduleRowsForUser({
+    supabase: params.supabase,
+    userId: params.userId,
+    limit: 800,
+  }).catch(() => []);
+
+  const todaySchedule = filterScheduleRowsForDateOnly({
+    rows: scheduleRowsForContext,
+    dateOnly: todayDate,
+  });
+
+  const updatedForToday = todaySchedule.find(
+    (r) => String(r.id ?? "") === params.args.scheduleId
+  );
+
+  const conflictStartMin = parseTimeToMinutes(
+    typeof (updatedForToday ?? (updatedRow as Record<string, unknown> | null))
+      ?.start_time === "string"
+      ? String(
+          (updatedForToday ?? (updatedRow as Record<string, unknown> | null))
+            ?.start_time
+        )
+      : null
+  );
+  const conflictEndMin = parseTimeToMinutes(
+    typeof (updatedForToday ?? (updatedRow as Record<string, unknown> | null))
+      ?.end_time === "string"
+      ? String(
+          (updatedForToday ?? (updatedRow as Record<string, unknown> | null))
+            ?.end_time
+        )
+      : null
+  );
+
+  if (conflictStartMin === null || conflictEndMin === null) {
+    return { ok: true, scheduleId: params.args.scheduleId } as const;
+  }
+
+  const sleepObject =
+    user &&
+    typeof (user as { sleep_schedule?: unknown }).sleep_schedule === "object"
+      ? ((user as { sleep_schedule?: unknown }).sleep_schedule as Record<
+          string,
+          unknown
+        >)
+      : null;
+  const scheduleRangeStart =
+    normalizeHHMM(sleepObject?.typicalWakeTime) ?? "06:00";
+  const scheduleRangeEnd =
+    normalizeHHMM(sleepObject?.typicalBedtime) ?? "23:00";
+
+  const { data: todayPlan } = await params.supabase
+    .from("daily_plans")
+    .select("id, workout_plan_id, meal_plan_id, reading_goal_id")
+    .eq("user_id", params.userId)
+    .eq("plan_date", todayDate)
+    .maybeSingle();
+
+  if (!todayPlan?.id) {
+    return { ok: true, scheduleId: params.args.scheduleId } as const;
+  }
+
+  const workoutPlanId = todayPlan.workout_plan_id
+    ? String((todayPlan as { workout_plan_id?: unknown }).workout_plan_id)
+    : null;
+  const mealPlanId = todayPlan.meal_plan_id
+    ? String((todayPlan as { meal_plan_id?: unknown }).meal_plan_id)
+    : null;
+  const readingSessionId = todayPlan.reading_goal_id
+    ? String((todayPlan as { reading_goal_id?: unknown }).reading_goal_id)
+    : null;
+
+  const rescheduled: {
+    workout?: { from: string; to: string };
+    meals?: Array<{ id: string; from: string; to: string }>;
+    reading?: { from: string; to: string };
+  } = {};
+
+  const busyForRescheduling = todaySchedule
+    .map((e) => ({
+      startMin: parseTimeToMinutes(
+        typeof e.start_time === "string" ? e.start_time : null
+      ),
+      endMin: parseTimeToMinutes(
+        typeof e.end_time === "string" ? e.end_time : null
+      ),
+    }))
+    .filter(
+      (w): w is { startMin: number; endMin: number } =>
+        typeof w.startMin === "number" &&
+        Number.isFinite(w.startMin) &&
+        typeof w.endMin === "number" &&
+        Number.isFinite(w.endMin)
+    );
+
+  const addBusy = (startMin: number, endMin: number) => {
+    if (!Number.isFinite(startMin) || !Number.isFinite(endMin)) return;
+    if (endMin <= startMin) return;
+    busyForRescheduling.push({ startMin, endMin });
+  };
+
+  const computeWindowsWithBusy = () =>
+    computeFreeTimeWindows({
+      busy: busyForRescheduling.map((b) => ({
+        startTime: minutesToTime(b.startMin),
+        endTime: minutesToTime(b.endMin),
+      })),
+      rangeStartTime: scheduleRangeStart,
+      rangeEndTime: scheduleRangeEnd,
+    });
+
+  if (workoutPlanId) {
+    const { data: workoutPlan } = await params.supabase
+      .from("workout_plans")
+      .select("id, scheduled_time, total_duration_minutes, completed")
+      .eq("id", workoutPlanId)
+      .eq("user_id", params.userId)
+      .maybeSingle();
+
+    const isCompleted =
+      typeof (workoutPlan as { completed?: unknown } | null)?.completed ===
+      "boolean"
+        ? Boolean((workoutPlan as { completed?: unknown } | null)?.completed)
+        : false;
+
+    const startMin = parseTimeToMinutes(
+      typeof (workoutPlan as { scheduled_time?: unknown } | null)
+        ?.scheduled_time === "string"
+        ? String(
+            (workoutPlan as { scheduled_time?: unknown } | null)?.scheduled_time
+          )
+        : null
+    );
+    const duration =
+      typeof (workoutPlan as { total_duration_minutes?: unknown } | null)
+        ?.total_duration_minutes === "number"
+        ? Math.max(
+            10,
+            Math.min(
+              240,
+              Number(
+                (workoutPlan as { total_duration_minutes?: unknown } | null)
+                  ?.total_duration_minutes
+              )
+            )
+          )
+        : 45;
+
+    if (!isCompleted && startMin !== null) {
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: conflictStartMin,
+          bEnd: conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+
+        if (picked) {
+          const pickedMin = parseTimeToMinutes(picked);
+          if (pickedMin !== null) {
+            const from = minutesToTime(startMin);
+            const to = picked;
+            const { error: updateWorkoutError } = await params.supabase
+              .from("workout_plans")
+              .update({ scheduled_time: toHHMMSS(to) })
+              .eq("id", workoutPlanId)
+              .eq("user_id", params.userId);
+            if (!updateWorkoutError) {
+              rescheduled.workout = { from, to };
+              addBusy(pickedMin, pickedMin + duration);
+            }
+          }
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (mealPlanId) {
+    const { data: meals } = await params.supabase
+      .from("meals")
+      .select(
+        "id, scheduled_time, scheduled_date, status, actually_eaten, logged_at"
+      )
+      .eq("meal_plan_id", mealPlanId)
+      .eq("user_id", params.userId)
+      .eq("scheduled_date", todayDate)
+      .eq("status", "active");
+
+    const rows = ((meals as unknown[] | null) ?? []) as Array<
+      Record<string, unknown>
+    >;
+    for (const meal of rows) {
+      const id = String(meal.id ?? "");
+      if (!id) continue;
+      const alreadyEaten =
+        meal.actually_eaten === true || typeof meal.logged_at === "string";
+      if (alreadyEaten) continue;
+      const startMin = parseTimeToMinutes(
+        typeof meal.scheduled_time === "string"
+          ? String(meal.scheduled_time)
+          : null
+      );
+      if (startMin === null) continue;
+      const duration = 30;
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: conflictStartMin,
+          bEnd: conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+        if (!picked) continue;
+        const pickedMin = parseTimeToMinutes(picked);
+        if (pickedMin === null) continue;
+        const from = minutesToTime(startMin);
+        const to = picked;
+        const { error: updateMealError } = await params.supabase
+          .from("meals")
+          .update({ scheduled_time: toHHMMSS(to) })
+          .eq("id", id)
+          .eq("user_id", params.userId);
+        if (!updateMealError) {
+          rescheduled.meals = rescheduled.meals ?? [];
+          rescheduled.meals.push({ id, from, to });
+          addBusy(pickedMin, pickedMin + duration);
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (readingSessionId) {
+    const { data: readingSession } = await params.supabase
+      .from("reading_sessions")
+      .select("id, scheduled_time, duration_minutes, ended_at")
+      .eq("id", readingSessionId)
+      .eq("user_id", params.userId)
+      .maybeSingle();
+
+    const isDone = !!(readingSession as { ended_at?: unknown } | null)
+      ?.ended_at;
+    const startMin = parseTimeToMinutes(
+      typeof (readingSession as { scheduled_time?: unknown } | null)
+        ?.scheduled_time === "string"
+        ? String(
+            (readingSession as { scheduled_time?: unknown } | null)
+              ?.scheduled_time
+          )
+        : null
+    );
+    const duration =
+      typeof (readingSession as { duration_minutes?: unknown } | null)
+        ?.duration_minutes === "number"
+        ? Math.max(
+            10,
+            Math.min(
+              180,
+              Number(
+                (readingSession as { duration_minutes?: unknown } | null)
+                  ?.duration_minutes
+              )
+            )
+          )
+        : 25;
+
+    if (!isDone && startMin !== null) {
+      const endMin = startMin + duration;
+      if (
+        overlapsMinutes({
+          aStart: startMin,
+          aEnd: endMin,
+          bStart: conflictStartMin,
+          bEnd: conflictEndMin,
+        })
+      ) {
+        const windows = computeWindowsWithBusy();
+        const picked =
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: conflictEndMin,
+          }) ??
+          pickFirstStartTimeInWindows({
+            windows,
+            minDurationMinutes: duration,
+            notBeforeMinutes: 0,
+          });
+        if (picked) {
+          const pickedMin = parseTimeToMinutes(picked);
+          if (pickedMin !== null) {
+            const from = minutesToTime(startMin);
+            const to = picked;
+            const { error: updateReadingError } = await params.supabase
+              .from("reading_sessions")
+              .update({ scheduled_time: toHHMMSS(to) })
+              .eq("id", readingSessionId)
+              .eq("user_id", params.userId);
+            if (!updateReadingError) {
+              rescheduled.reading = { from, to };
+              addBusy(pickedMin, pickedMin + duration);
+            }
+          }
+        }
+      } else {
+        addBusy(startMin, endMin);
+      }
+    }
+  }
+
+  if (rescheduled.workout || rescheduled.reading || rescheduled.meals?.length) {
+    return {
+      ok: true,
+      scheduleId: params.args.scheduleId,
+      rescheduled,
+      planDate: todayDate,
+    } as const;
   }
 
   return { ok: true, scheduleId: params.args.scheduleId } as const;
@@ -812,6 +1847,14 @@ async function mealSwap(params: {
     >;
 
     const normalizedOld = params.args.oldMealName?.trim().toLowerCase() ?? null;
+    if (!scheduledTime && !normalizedOld && rows.length > 1) {
+      return {
+        ok: false,
+        error:
+          "Multiple meals match that date/type. Provide mealId or scheduledTime.",
+      } as const;
+    }
+
     const pick =
       scheduledTime || rows.length <= 1
         ? rows[0]
@@ -823,6 +1866,22 @@ async function mealSwap(params: {
                   .toLowerCase() === normalizedOld
             ) ?? rows[0])
           : rows[0];
+
+    if (!scheduledTime && normalizedOld && rows.length > 1) {
+      const matched = rows.find(
+        (r) =>
+          String(r.name ?? "")
+            .trim()
+            .toLowerCase() === normalizedOld
+      );
+      if (!matched) {
+        return {
+          ok: false,
+          error:
+            "Could not match oldMealName for that meal slot. Provide mealId or scheduledTime.",
+        } as const;
+      }
+    }
 
     target = pick
       ? ({
@@ -905,6 +1964,10 @@ async function mealSwap(params: {
     ok: true,
     replacedMealId: target.id,
     newMealId: String((inserted as { id: unknown }).id),
+    mealType: target.meal_type,
+    scheduledDate: target.scheduled_date,
+    scheduledTime: target.scheduled_time,
+    newMealName: newName,
   } as const;
 }
 
@@ -1005,7 +2068,57 @@ async function runScheduleToolCall(params: {
 }
 
 export async function POST(request: Request) {
-  const body = ChatBodySchema.parse(await request.json());
+  const rawBody = await request.json();
+
+  const scheduleAction = ScheduleActionBodySchema.safeParse(rawBody);
+  if (scheduleAction.success) {
+    const supabase = getSupabaseAdmin();
+    const userId = scheduleAction.data.userId;
+    const action = scheduleAction.data.action;
+    if (action === "schedule_create") {
+      return NextResponse.json(
+        await scheduleCreateOneOff({
+          supabase,
+          userId,
+          args: scheduleAction.data.args,
+        })
+      );
+    }
+    if (action === "schedule_update") {
+      return NextResponse.json(
+        await scheduleUpdate({
+          supabase,
+          userId,
+          args: scheduleAction.data.args,
+        })
+      );
+    }
+    if (action === "schedule_delete") {
+      return NextResponse.json(
+        await scheduleDelete({
+          supabase,
+          userId,
+          scheduleId: scheduleAction.data.args.scheduleId,
+        })
+      );
+    }
+    return NextResponse.json(
+      await scheduleList({
+        supabase,
+        userId,
+        args: scheduleAction.data.args,
+      })
+    );
+  }
+
+  const bodyParsed = ChatBodySchema.safeParse(rawBody);
+  if (!bodyParsed.success) {
+    return NextResponse.json(
+      { ok: false, error: "Invalid request body." },
+      { status: 400 }
+    );
+  }
+  const body = bodyParsed.data;
 
   const clientConfigs = getClientConfigsForManager(body.manager);
   if (!clientConfigs.length) {
@@ -1140,6 +2253,7 @@ export async function POST(request: Request) {
         )
         .eq("meal_plan_id", mealPlanId)
         .eq("user_id", body.userId)
+        .eq("scheduled_date", todayDate)
         .eq("status", "active")
         .order("scheduled_time", { ascending: true })
     : { data: null };
@@ -1161,13 +2275,27 @@ export async function POST(request: Request) {
     latestMeasurement,
   };
 
+  const mealsForToday = ((meals as unknown[] | null) ?? []) as Array<
+    Record<string, unknown>
+  >;
+  const scheduleForContext =
+    mealsForToday.length > 0
+      ? todayScheduleForContext.filter((row) => {
+          const eventType =
+            typeof row.event_type === "string" ? row.event_type : null;
+          const specificDate =
+            typeof row.specific_date === "string" ? row.specific_date : null;
+          return eventType !== "meal" || !!specificDate;
+        })
+      : todayScheduleForContext;
+
   const todayContext = {
     date: todayDate,
-    schedule: todayScheduleForContext,
+    schedule: scheduleForContext,
     dailyPlan: todayPlan ?? null,
     workoutPlan: workoutPlan ?? null,
     mealPlan: mealPlan ?? null,
-    meals: meals ?? [],
+    meals: mealsForToday,
     readingSession: readingSession ?? null,
   };
 
@@ -1176,14 +2304,17 @@ export async function POST(request: Request) {
     "SCHEDULE PERSISTENCE:",
     "- You have tools to read/write schedule entries: schedule_list, schedule_create, schedule_update.",
     "- If the user asks to add/schedule an event, you MUST call schedule_create (do not just promise).",
+    "- If the user asks to move/reschedule an existing schedule event, you MUST call schedule_update.",
+    "- If the user mentions a new commitment that blocks time (e.g. chores, meeting), schedule it as an event.",
     "- Use schedule_list to check conflicts when needed before scheduling.",
     "- schedule_delete is only for explicit user requests to delete/remove/cancel an event.",
+    "- Never claim something was scheduled/moved unless a tool returned ok:true.",
   ].join("\n");
   const mealToolPolicy = [
     "MEAL SWAPS PERSISTENCE:",
     "- You have a tool meal_swap to replace a meal in the user's plan.",
     "- If the user confirms a swap (e.g. chooses Option 1/2/3), you MUST call meal_swap.",
-    "- Prefer MEAL_ID from the user's message when present (MEAL_ID=...).",
+    "- If the user's message includes MEAL_ID=..., you MUST pass that as mealId.",
     "- Do not claim the meal was swapped unless the tool returns ok:true.",
   ].join("\n");
 
@@ -1221,6 +2352,101 @@ export async function POST(request: Request) {
           .limit(30);
 
   const { data: history } = await historyQuery;
+
+  const selectedOption =
+    body.manager === "olive" ? parseMealSwapSelection(body.message) : null;
+  if (body.manager === "olive" && selectedOption) {
+    const historyRows = ((history as unknown[] | null) ?? []) as Array<
+      Record<string, unknown>
+    >;
+    const optionsIdx = historyRows.findIndex(
+      (m) =>
+        m.role === "assistant" &&
+        /option\s*1\s*[–-]/i.test(String(m.content ?? ""))
+    );
+    const optionsText =
+      optionsIdx >= 0 ? String(historyRows[optionsIdx]?.content ?? "") : "";
+
+    const tail = optionsIdx >= 0 ? historyRows.slice(optionsIdx + 1) : [];
+    const swapRequest = tail.find(
+      (m) => m.role === "user" && /MEAL_ID=/i.test(String(m.content ?? ""))
+    );
+    const mealId = swapRequest
+      ? extractTagValue(String(swapRequest.content ?? ""), "MEAL_ID")
+      : null;
+
+    const optionMap = optionsText ? parseMealOptions(optionsText) : new Map();
+    const chosen = optionMap.get(selectedOption) ?? null;
+
+    if (mealId && chosen?.name) {
+      const swapResult = await mealSwap({
+        supabase,
+        userId: body.userId,
+        args: {
+          mealId,
+          newMealName: chosen.name,
+          calories: chosen.calories ?? undefined,
+          protein_g: chosen.protein_g ?? undefined,
+          carbs_g: chosen.carbs_g ?? undefined,
+          fats_g: chosen.fats_g ?? undefined,
+        },
+      });
+
+      const reply = swapResult.ok
+        ? [
+            `Swapped—your ${String(swapResult.scheduledTime ?? "").slice(0, 5)} ${swapResult.mealType} is now:`,
+            "",
+            swapResult.newMealName,
+            chosen.calories &&
+            chosen.protein_g &&
+            chosen.carbs_g &&
+            chosen.fats_g
+              ? `${chosen.calories} kcal | ${chosen.protein_g} P | ${chosen.carbs_g} C | ${chosen.fats_g} F`
+              : "",
+          ]
+            .filter((l) => l !== "")
+            .join("\n")
+        : String(swapResult.error ?? "Swap failed");
+
+      const savedAssistantMessage = await supabase
+        .from("conversations")
+        .insert({
+          user_id: body.userId,
+          manager: body.manager,
+          role: "assistant",
+          content: reply,
+        })
+        .select("id, created_at, manager, role, content")
+        .single();
+
+      const assistantConversationRow =
+        (savedAssistantMessage.data as ConversationRow | null) ?? null;
+
+      try {
+        const embedding = await generateEmbedding(reply);
+        if (embedding && assistantConversationRow?.id) {
+          await supabase.from("embeddings").insert({
+            conversation_id: assistantConversationRow.id,
+            user_id: body.userId,
+            embedding,
+            content_chunk: reply,
+            manager: body.manager,
+            category: getCategoryForManager(body.manager),
+          });
+        }
+      } catch {}
+
+      return NextResponse.json({
+        ok: true,
+        reply,
+        userMessage: userConversationRow,
+        assistantMessage: assistantConversationRow,
+        coordinationLog: null,
+        providerUsed: "openai",
+        modelUsed: "tool-bypass",
+      });
+    }
+  }
 
   const allowDelete = isExplicitDeletionRequest(body.message);
   const scheduleTools = buildScheduleTools({ allowDelete });
@@ -1420,6 +2646,11 @@ export async function POST(request: Request) {
     reply: finalReply,
     userMessage: userConversationRow,
     assistantMessage: assistantConversationRow,
+    coordinationLog:
+      body.manager === "atlas"
+        ? ((todayPlan as { coordination_log?: unknown } | null)
+            ?.coordination_log ?? null)
+        : null,
     providerUsed,
     modelUsed,
   });

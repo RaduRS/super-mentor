@@ -13,7 +13,7 @@ import {
 } from "@/components/ui/card";
 import { useLocalUserSession } from "@/lib/session/useLocalUserSession";
 
-export default function DashboardPage() {
+export default function SchedulePage() {
   const { currentUser, loading } = useLocalUserSession();
 
   if (loading) {
@@ -55,9 +55,10 @@ export default function DashboardPage() {
     <div className="min-h-screen bg-zinc-50 font-sans text-zinc-950 dark:bg-black dark:text-zinc-50">
       <main className="mx-auto flex w-full max-w-7xl flex-col gap-8 px-4 py-10 sm:px-6 sm:py-16 2xl:max-w-screen-2xl">
         <AppShell>
-          <DailyDashboard userId={currentUser.id} mode="overview" />
+          <DailyDashboard userId={currentUser.id} mode="schedule" />
         </AppShell>
       </main>
     </div>
   );
 }
+
